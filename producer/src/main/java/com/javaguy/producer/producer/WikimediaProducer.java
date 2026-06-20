@@ -13,7 +13,18 @@ public class WikimediaProducer {
     private final KafkaTemplate<String, String> kafkaTemplate;
 
     public void sendMessage(String message) {
-        log.info("Sending message='{}'", message);
-        kafkaTemplate.send("wikimedia-stream", message);
+        kafkaTemplate.send("wikimedia-stream", message)
+                .whenComplete((result, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to send message: {}", ex.getMessage());
+                    } else {
+                        log.debug(
+                                "Sent → topic={} partition={} offset={}",
+                                result.getRecordMetadata().topic(),
+                                result.getRecordMetadata().partition(),
+                                result.getRecordMetadata().offset()
+                        );
+                    }
+                });
     }
 }

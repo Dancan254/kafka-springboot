@@ -1,11 +1,52 @@
 spring:
   kafka:
+    # Top-level bootstrap-servers is inherited by both the ConsumerFactory
+    # and the ProducerFactory (used by DeadLetterPublishingRecoverer).
+    bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
+
     consumer:
-      bootstrap-servers: localhost:9092
-      group-id: consumer-group
+      group-id: wikimedia-consumer-group
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable-auto-commit: false
+      max-poll-records: 500
+      properties:
+        isolation.level: read_committed
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 15000
+        max.poll.interval.ms: 300000
+
+    # Minimal producer config — used only by DeadLetterPublishingRecoverer to
+    # publish failed records to wikimedia-stream.dlt. The consumer application
+    # does not produce to any user-facing topics.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 3
+
+    # NOTE: spring.kafka.listener.* properties are intentionally absent here.
+    # The ConcurrentKafkaListenerContainerFactory is declared in KafkaConsumerConfig,
+    # which owns all listener-level settings (ack-mode, concurrency, poll-timeout).
+    # Spring Boot's auto-configured factory (and its YAML bindings) is not used.
+
+  datasource:
+    url: jdbc:h2:mem:wikimediadb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: password
+
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
 
 server:
   port: 8082

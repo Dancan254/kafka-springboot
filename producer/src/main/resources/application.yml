@@ -1,10 +1,57 @@
 spring:
   kafka:
     producer:
-      bootstrap-servers: localhost:9092
+      # Point to all 3 brokers — the client only needs one to bootstrap,
+      # but listing all three removes that single point of failure.
+      bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
+
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
 
+      # acks=all → leader waits for ALL in-sync replicas to acknowledge before
+      # returning success. Highest durability guarantee; small latency cost.
+      # acks=1 → leader only (risk of data loss if leader crashes before replication)
+      # acks=0 → fire-and-forget (fastest, no guarantee)
+      acks: all
+
+      # How many times to retry a failed send before throwing an exception.
+      # With enable.idempotence=true this is effectively infinite; set a cap here
+      # to surface persistent broker issues to your application.
+      retries: 3
+
+      # Snappy offers a good balance: fast compression/decompression, solid ratio.
+      # Use lz4 for maximum throughput, gzip for maximum compression ratio,
+      # zstd for the best overall ratio-to-speed trade-off in Kafka 2.1+.
+      compression-type: snappy
+
+      # Batch up to 32 KiB of records before flushing.
+      # Larger batches → better throughput and compression efficiency.
+      # Smaller batches → lower latency.
+      batch-size: 32768
+
+      # Total memory available to the producer for buffering.
+      # If this is exhausted, send() will block for max.block.ms then throw.
+      buffer-memory: 33554432
+
+      properties:
+        # Exactly-once per-partition: the broker deduplicates retried sends
+        # using a sequence number, so a network retry never produces a duplicate.
+        # Requires acks=all and retries > 0.
+        enable.idempotence: true
+
+        # Maximum in-flight requests per connection. With idempotence enabled,
+        # Kafka 3.x allows up to 5 while still guaranteeing ordering.
+        max.in.flight.requests.per.connection: 5
+
+        # Wait up to 20 ms before flushing a batch, giving more records a chance
+        # to accumulate. The throughput–latency sweet spot is usually 5–20 ms.
+        linger.ms: 20
+
+        # Total time (ms) a send call has to succeed, including retries and waits.
+        delivery.timeout.ms: 120000
+
+        # Time to wait for a response from the broker on a single request.
+        request.timeout.ms: 30000
 
 server:
   port: 8081
