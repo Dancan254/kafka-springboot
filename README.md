@@ -35,61 +35,45 @@ Production-grade Kafka integration built on a real-world use case: streaming liv
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        Wikimedia SSE Stream                              │
-│               https://stream.wikimedia.org/v2/stream/recentchange        │
-└───────────────────────────────┬──────────────────────────────────────────┘
-                                │  Server-Sent Events (one JSON per edit)
-                                ▼
-┌─────────────────────────────────────────────────────────┐
-│                   Producer Service  :8081               │
-│   WikimediaStreamConsumer ──► WikimediaProducer         │
-│       (WebClient / Flux)       (KafkaTemplate)          │
-└─────────────────────────────┬───────────────────────────┘
-                              │  acks=all  idempotent  snappy
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Kafka Cluster (KRaft, 3 brokers)                   │
-│                                                                         │
-│   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐              │
-│   │   kafka-1    │   │   kafka-2    │   │   kafka-3    │              │
-│   │  :9092       │   │  :9093       │   │  :9094       │              │
-│   │  broker +    │   │  broker +    │   │  broker +    │              │
-│   │  controller  │   │  controller  │   │  controller  │              │
-│   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘              │
-│          │                  │                   │                       │
-│          └──────────────────┼───────────────────┘                       │
-│                             │                                            │
-│               Topic: wikimedia-stream                                    │
-│               Partitions: 3  │  Replication: 3  │  Min-ISR: 2          │
-│                                                                         │
-│   Partition 0: Leader=kafka-1  Replicas=[kafka-2, kafka-3]             │
-│   Partition 1: Leader=kafka-2  Replicas=[kafka-3, kafka-1]             │
-│   Partition 2: Leader=kafka-3  Replicas=[kafka-1, kafka-2]             │
-└─────────────────────────────┬───────────────────────────────────────────┘
-                              │  manual-ack  read_committed  3 threads
-                              ▼
-┌─────────────────────────────────────────────────────────┐
-│                   Consumer Service  :8082               │
-│   WikimediaConsumer (group: wikimedia-consumer-group)   │
-│   Thread-0 → Partition 0                               │
-│   Thread-1 → Partition 1                               │
-│   Thread-2 → Partition 2                               │
-│                                                         │
-│   On failure → DefaultErrorHandler                      │
-│       retry 1 (1 s) → retry 2 (2 s) → retry 3 (4 s)   │
-│       → DeadLetterPublishingRecoverer                   │
-└──────────────────────┬──────────────────────────────────┘
-                       │  failed record + diagnostic headers
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│        Topic: wikimedia-stream.dlt  (3 partitions)      │
-│        Retention: 30 days                               │
-│                                                         │
-│   WikimediaDltConsumer (group: wikimedia-dlt-consumer-group) │
-│   Logs: originalTopic / originalOffset / exceptionClass │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    SSE["Wikimedia SSE Stream\nstream.wikimedia.org/v2/stream/recentchange"]
+
+    subgraph ProducerSvc["Producer Service  :8081"]
+        WSC["WikimediaStreamConsumer\nWebClient / Flux"]
+        WP["WikimediaProducer\nKafkaTemplate"]
+        WSC --> WP
+    end
+
+    SSE -->|"Server-Sent Events — one JSON per edit"| WSC
+
+    subgraph KafkaCluster["Kafka Cluster — KRaft, 3 brokers"]
+        K1["kafka-1  :9092\nbroker + controller"]
+        K2["kafka-2  :9093\nbroker + controller"]
+        K3["kafka-3  :9094\nbroker + controller"]
+        TP["wikimedia-stream\nPartitions: 3  ·  Replication: 3  ·  Min-ISR: 2\nP0: Leader=kafka-1  ·  P1: Leader=kafka-2  ·  P2: Leader=kafka-3"]
+        K1 & K2 & K3 --- TP
+    end
+
+    WP -->|"acks=all · idempotent · snappy"| KafkaCluster
+
+    subgraph ConsumerSvc["Consumer Service  :8082"]
+        WC["WikimediaConsumer\ngroup: wikimedia-consumer-group"]
+        T0["Thread-0 → Partition 0"]
+        T1["Thread-1 → Partition 1"]
+        T2["Thread-2 → Partition 2"]
+        EH["DefaultErrorHandler\nretry 1 (1 s) → retry 2 (2 s) → retry 3 (4 s)\n→ DeadLetterPublishingRecoverer"]
+        WC --> T0 & T1 & T2
+        T0 & T1 & T2 --> EH
+    end
+
+    KafkaCluster -->|"manual-ack · read_committed · 3 threads"| ConsumerSvc
+
+    subgraph DLTTopic["wikimedia-stream.dlt  ·  3 partitions  ·  30-day retention"]
+        DLTC["WikimediaDltConsumer\ngroup: wikimedia-dlt-consumer-group\nLogs: originalTopic / originalOffset / exceptionClass"]
+    end
+
+    EH -->|"failed record + diagnostic headers"| DLTTopic
 ```
 
 ---
@@ -141,16 +125,16 @@ Kafka replicates each partition across multiple brokers for fault tolerance.
 
 **How durability works:**
 
+```mermaid
+flowchart LR
+    P["Producer"] --> L["Leader\nkafka-1"]
+    L --> F1["Follower\nkafka-2"]
+    L --> F2["Follower\nkafka-3"]
+    F1 & F2 -->|"Both ACK"| ISR["ISR = {kafka-1, kafka-2, kafka-3}"]
 ```
-Producer → Leader (kafka-1)
-              │
-              ├──► Follower (kafka-2)  ─┐
-              │                          ├─ Both ACK → ISR = {kafka-1, kafka-2, kafka-3}
-              └──► Follower (kafka-3)  ─┘
 
-If kafka-2 falls behind → ISR = {kafka-1, kafka-3}
-If ISR drops below min.insync.replicas=2 → leader rejects writes (safer than silent data loss)
-```
+> If `kafka-2` falls behind: ISR shrinks to `{kafka-1, kafka-3}`  
+> If ISR drops below `min.insync.replicas=2`: the leader rejects writes (safer than silent data loss)
 
 **Production rule of thumb:** RF=3, min.insync.replicas=2. This lets you lose one broker (for maintenance or failure) while still accepting writes, and guarantees that at least two copies of every message always exist.
 
@@ -158,16 +142,25 @@ If ISR drops below min.insync.replicas=2 → leader rejects writes (safer than s
 
 A **consumer group** is a logical subscriber. Kafka distributes partitions across the group members so each partition is consumed by exactly one member at a time.
 
+```mermaid
+flowchart LR
+    subgraph Group["wikimedia-consumer-group"]
+        C0["Consumer-0"]
+        C1["Consumer-1"]
+        C2["Consumer-2"]
+    end
+    subgraph Topic["wikimedia-stream  (3 partitions)"]
+        P0["Partition 0"]
+        P1["Partition 1"]
+        P2["Partition 2"]
+    end
+    C0 --> P0
+    C1 --> P1
+    C2 --> P2
 ```
-Topic (3 partitions) + Group "wikimedia-consumer-group" (3 consumers):
 
-Consumer-0 → Partition 0
-Consumer-1 → Partition 1
-Consumer-2 → Partition 2
-
-Adding a 4th consumer: one consumer sits idle (more consumers than partitions → no assignment)
-Removing Consumer-1: Partition 1 is reassigned to Consumer-0 or Consumer-2 (rebalance)
-```
+> Adding a 4th consumer: one consumer sits idle — more consumers than partitions means no assignment.  
+> Removing Consumer-1: Partition 1 is reassigned to Consumer-0 or Consumer-2 (rebalance).
 
 **Horizontal scaling:** Add more consumers (up to the partition count) to scale throughput linearly. Once you have as many consumers as partitions, you need more partitions to scale further.
 
@@ -304,21 +297,13 @@ A **dead-letter topic** is where records go when they can't be processed success
 
 **How it works in this project:**
 
-```
-@KafkaListener (WikimediaConsumer)
-        │
-        │  throws exception
-        ▼
-DefaultErrorHandler
-  ├── retryable exception?
-  │     yes → ExponentialBackOffWithMaxRetries (1s → 2s → 4s)
-  │     no  → skip retries immediately (IllegalArgumentException)
-  │
-  └── retries exhausted → DeadLetterPublishingRecoverer
-                               │
-                               └── publish to wikimedia-stream.dlt
-                                   (same partition as source)
-                                   + diagnostic headers
+```mermaid
+flowchart TD
+    Listener["@KafkaListener\nWikimediaConsumer"] -->|"throws exception"| EH["DefaultErrorHandler"]
+    EH -->|"retryable exception"| Retry["ExponentialBackOffWithMaxRetries\n1 s → 2 s → 4 s"]
+    EH -->|"non-retryable e.g. IllegalArgumentException"| Skip["skip retries immediately"]
+    Retry -->|"retries exhausted"| DLT["DeadLetterPublishingRecoverer\n→ wikimedia-stream.dlt\nsame partition as source\n+ diagnostic headers"]
+    Skip --> DLT
 ```
 
 **DLT headers added automatically by Spring Kafka:**
@@ -370,16 +355,21 @@ Confluent Schema Registry (running at `http://localhost:8085` in this project) p
 2. **Compatibility enforcement** — rejects producer schemas that would break existing consumers (BACKWARD, FORWARD, or FULL compatibility modes)
 3. **Wire format** — producers embed only a schema ID (4 bytes) in the message, not the full schema, which drastically reduces message size
 
-```
-Producer:
-  1. Register schema with registry → gets schema_id=5
-  2. Serialize record: [magic byte] [schema_id=5] [avro bytes]
-  3. Publish to Kafka
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant R as Schema Registry
+    participant K as Kafka
+    participant C as Consumer
 
-Consumer:
-  1. Read [magic byte][schema_id=5][avro bytes]
-  2. Fetch schema definition for id=5 from registry (cached after first fetch)
-  3. Deserialize avro bytes using fetched schema
+    P->>R: Register schema
+    R-->>P: schema_id = 5
+    P->>K: Publish [magic byte][schema_id=5][avro bytes]
+    C->>K: Read message
+    K-->>C: [magic byte][schema_id=5][avro bytes]
+    C->>R: Fetch schema for id=5 (cached after first fetch)
+    R-->>C: schema definition
+    C->>C: Deserialize avro bytes
 ```
 
 **When to use it:** Any time you have multiple producers or consumers that evolve independently. The registry prevents the "schema mismatch" production incident class entirely.
@@ -449,22 +439,40 @@ All services share the `kafka-network` Docker bridge network. Inter-broker traff
 
 ### Listener Architecture
 
-```
-Host machine (your laptop / CI server)
-│
-│  localhost:9092 ──► kafka-1 container :9092 (PLAINTEXT_HOST)
-│  localhost:9093 ──► kafka-2 container :9092 (PLAINTEXT_HOST)
-│  localhost:9094 ──► kafka-3 container :9092 (PLAINTEXT_HOST)
-│
-└── Docker kafka-network
-    │
-    ├── kafka-1:29092  (PLAINTEXT  — inter-broker)
-    ├── kafka-2:29092  (PLAINTEXT  — inter-broker)
-    ├── kafka-3:29092  (PLAINTEXT  — inter-broker)
-    │
-    ├── kafka-1:29093  (CONTROLLER — Raft quorum)
-    ├── kafka-2:29093  (CONTROLLER — Raft quorum)
-    └── kafka-3:29093  (CONTROLLER — Raft quorum)
+```mermaid
+flowchart TD
+    subgraph Host["Host Machine"]
+        H1["localhost:9092"]
+        H2["localhost:9093"]
+        H3["localhost:9094"]
+    end
+
+    subgraph DockerNet["Docker  kafka-network"]
+        subgraph K1["kafka-1"]
+            K1H["PLAINTEXT_HOST :9092"]
+            K1I["PLAINTEXT :29092\ninter-broker"]
+            K1C["CONTROLLER :29093\nRaft quorum"]
+        end
+        subgraph K2["kafka-2"]
+            K2H["PLAINTEXT_HOST :9092"]
+            K2I["PLAINTEXT :29092\ninter-broker"]
+            K2C["CONTROLLER :29093\nRaft quorum"]
+        end
+        subgraph K3["kafka-3"]
+            K3H["PLAINTEXT_HOST :9092"]
+            K3I["PLAINTEXT :29092\ninter-broker"]
+            K3C["CONTROLLER :29093\nRaft quorum"]
+        end
+
+        K1I <--> K2I
+        K2I <--> K3I
+        K1C <--> K2C
+        K2C <--> K3C
+    end
+
+    H1 --> K1H
+    H2 --> K2H
+    H3 --> K3H
 ```
 
 ---
@@ -477,97 +485,230 @@ Host machine (your laptop / CI server)
 - Java 21+
 - Maven 3.9+
 
-### 1. Start the Infrastructure
+---
+
+### Step 1 — Start the Kafka cluster
 
 ```bash
 docker compose up -d
 ```
 
-Wait for all three brokers to pass their health checks (~30 s):
+Wait for all three brokers to become healthy (~30 s):
 
 ```bash
 docker compose ps
 ```
 
-All services should show `healthy`.
+Every service should show `healthy` in the STATUS column. If a broker is still starting, wait another 15 s and re-run.
 
-### 2. Verify the Cluster
-
-```bash
-# List brokers via any broker's API
-docker exec kafka-1 kafka-broker-api-versions --bootstrap-server localhost:9092
-
-# Describe the cluster metadata
-docker exec kafka-1 kafka-metadata-quorum --bootstrap-server localhost:9092 describe --status
-
-# List topics (wikimedia-stream is auto-created on first app start)
-docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --list
-```
-
-### 3. Start the Producer
+Verify KRaft quorum (no ZooKeeper required):
 
 ```bash
-cd producer
-./mvnw spring-boot:run
+docker exec kafka-1 kafka-metadata-quorum \
+  --bootstrap-server localhost:9092 describe --status
 ```
 
-Then trigger the Wikimedia stream:
+You should see `LeaderId` and three voters listed.
 
-```bash
-curl http://localhost:8081/api/v1/wikimedia
-```
+---
 
-The producer will now consume the SSE feed and publish each event to `wikimedia-stream`.
+### Step 2 — Start the Consumer
 
-### 4. Start the Consumer
-
-In a separate terminal:
+Start the consumer **before** the producer so it is ready to receive messages as soon as they arrive and you can watch offsets advance in real time.
 
 ```bash
 cd consumer
 ./mvnw spring-boot:run
 ```
 
-You should see log lines like:
+Expected startup log:
 
 ```
-Received | partition=1 offset=42 message='{"$schema":"...",...}'
+Started ConsumerApplication in 3.2 seconds
 ```
 
-### 5. Explore with Kafka UI
+The topics `wikimedia-stream` and `wikimedia-stream.dlt` are auto-declared by `WikimediaTopicConfig` on startup.
 
-Open [http://localhost:8080](http://localhost:8080) to:
-- Browse the `wikimedia-stream` topic and its 3 partitions
-- Inspect consumer group lag for `wikimedia-consumer-group`
-- Examine per-broker replica assignments
-- View the active Raft controller
+---
+
+### Step 3 — Start the Producer
+
+Open a second terminal:
+
+```bash
+cd producer
+./mvnw spring-boot:run
+```
+
+Then trigger the Wikimedia live stream:
+
+```bash
+curl http://localhost:8081/api/v1/wikimedia
+```
+
+The producer connects to the Wikimedia SSE endpoint and begins publishing one JSON event per Wikipedia edit to `wikimedia-stream`. Back in the **consumer terminal** you will see:
+
+```
+Saved | partition=0 offset=0   type=edit wiki=enwiki  title='Lionel Messi'
+Saved | partition=2 offset=0   type=new  wiki=frwiki  title='Économie de la France'
+Saved | partition=1 offset=0   type=edit wiki=dewiki  title='Berlin'
+```
+
+---
+
+### Step 4 — Query the REST API
+
+The consumer exposes a REST API on port 8082. Try these while events are flowing:
+
+```bash
+# 10 most recently consumed events
+curl http://localhost:8082/api/v1/wikimedia/events/recent | jq
+
+# Paginated full list (newest first)
+curl "http://localhost:8082/api/v1/wikimedia/events?page=0&size=5" | jq
+
+# Filter by wiki
+curl http://localhost:8082/api/v1/wikimedia/events/wiki/enwiki | jq
+
+# Filter by event type: edit | new | log | categorize
+curl http://localhost:8082/api/v1/wikimedia/events/type/edit | jq
+
+# Aggregated stats — total events, bot vs human, breakdown by wiki and type
+curl http://localhost:8082/api/v1/wikimedia/events/stats | jq
+```
+
+Example stats response:
+
+```json
+{
+  "totalEvents": 1842,
+  "botEdits":    312,
+  "humanEdits":  1530,
+  "byWiki":  { "enwiki": 720, "dewiki": 280, "frwiki": 190 },
+  "byType":  { "edit": 1500, "new": 280, "log": 62 }
+}
+```
+
+---
+
+### Step 5 — Explore Kafka UI
+
+Open **http://localhost:8080** in a browser.
+
+**Brokers tab**
+- Confirms all 3 brokers are online and shows the active Raft controller.
+
+**Topics → wikimedia-stream**
+- *Overview*: partition count (3), replication factor (3), min ISR (2).
+- *Messages*: click a partition to browse individual records. You can see the raw JSON payload and record metadata (offset, timestamp, headers).
+- *Consumers*: shows `wikimedia-consumer-group` with per-partition lag. Lag should stay near 0 while the consumer is running.
+
+**Topics → wikimedia-stream.dlt**
+- Empty under normal operation. Messages appear here only after all retries are exhausted (see Step 6).
+
+**Consumer Groups → wikimedia-consumer-group**
+- Shows which partition is assigned to which consumer thread and current lag across all partitions.
+
+---
+
+### Step 6 — Simulate a DLT failure
+
+To see the dead-letter flow in action, temporarily make the consumer throw on a record by adding one line to `WikimediaConsumer.consume()`:
+
+```java
+// Add after the parse() call — remove after testing
+if (dto.type() != null && dto.type().equals("edit")) {
+    throw new RuntimeException("Simulated transient failure");
+}
+```
+
+Restart the consumer. In the logs you will see the record retried 3 times with exponential backoff:
+
+```
+ERROR o.s.k.l.DefaultErrorHandler - Record failed, retrying...  (attempt 1)
+ERROR o.s.k.l.DefaultErrorHandler - Record failed, retrying...  (attempt 2)
+ERROR o.s.k.l.DefaultErrorHandler - Record failed, retrying...  (attempt 3)
+ERROR c.j.c.consumer.WikimediaDltConsumer - [DLT] partition=0 offset=17 |
+      originalTopic=wikimedia-stream originalPartition=0 originalOffset=17 |
+      exception=java.lang.RuntimeException cause='Simulated transient failure' |
+      value='{"type":"edit","title":"..."}'
+```
+
+Now check the DLT in Kafka UI (**Topics → wikimedia-stream.dlt → Messages**) — you will see the failed record with its full diagnostic headers visible in the *Headers* panel.
+
+To trigger the **non-retryable** path (straight to DLT, no backoff):
+
+```java
+throw new IllegalArgumentException("Simulated permanent failure");
+```
+
+This skips all retries and routes directly to the DLT in one step.
+
+Remove the throw and restart to return to normal operation.
+
+---
+
+### Step 7 — Browse the H2 database
+
+Open **http://localhost:8082/h2-console** in a browser.
+
+| Field | Value |
+|---|---|
+| JDBC URL | `jdbc:h2:mem:wikimediadb` |
+| User name | `sa` |
+| Password | `password` |
+
+Useful queries:
+
+```sql
+-- All events newest first
+SELECT * FROM WIKIMEDIA_EVENTS ORDER BY PROCESSED_AT DESC LIMIT 20;
+
+-- Count by wiki
+SELECT WIKI, COUNT(*) AS cnt FROM WIKIMEDIA_EVENTS GROUP BY WIKI ORDER BY cnt DESC;
+
+-- Bot vs human edits
+SELECT BOT, COUNT(*) FROM WIKIMEDIA_EVENTS GROUP BY BOT;
+
+-- Events per Kafka partition (confirms load spread across partitions)
+SELECT KAFKA_PARTITION, COUNT(*) FROM WIKIMEDIA_EVENTS GROUP BY KAFKA_PARTITION;
+```
+
+---
 
 ### Useful CLI Commands
 
 ```bash
-# Describe topic (partitions, leaders, ISR)
+# Describe topic — shows partition leaders, replicas, and current ISR
 docker exec kafka-1 kafka-topics \
   --bootstrap-server localhost:9092 \
-  --topic wikimedia-stream \
-  --describe
+  --topic wikimedia-stream --describe
 
 # Watch consumer group lag in real time
 docker exec kafka-1 kafka-consumer-groups \
   --bootstrap-server localhost:9092 \
-  --group wikimedia-consumer-group \
-  --describe
+  --group wikimedia-consumer-group --describe
 
-# Consume from the beginning (for ad-hoc inspection)
+# Inspect DLT messages including headers
 docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server localhost:9092 \
-  --topic wikimedia-stream \
+  --topic wikimedia-stream.dlt \
   --from-beginning \
-  --max-messages 10
+  --property print.headers=true \
+  --property print.offset=true \
+  --max-messages 5
 
-# Produce a test message manually
-docker exec -it kafka-1 kafka-console-producer \
+# Tail the live stream topic
+docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic wikimedia-stream
+
+# Reset consumer group offset to replay all events from the beginning
+docker exec kafka-1 kafka-consumer-groups \
+  --bootstrap-server localhost:9092 \
+  --group wikimedia-consumer-group \
+  --topic wikimedia-stream \
+  --reset-offsets --to-earliest --execute
 ```
 
 ---

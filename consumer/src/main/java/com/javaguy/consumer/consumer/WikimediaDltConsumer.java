@@ -19,9 +19,11 @@ public class WikimediaDltConsumer {
      * DeadLetterPublishingRecoverer after the main consumer exhausted its retries.
      *
      * In production you would typically:
-     *   1. Persist the failed record to a dead-letter store (DB, S3, etc.)
-     *   2. Fire an alert (PagerDuty, Slack, metric increment)
-     *   3. Provide an admin endpoint to replay or discard the record
+     * <ol>
+     *   <li>1. Persist the failed record to a dead-letter store (DB, S3, etc.)</>
+     *   <li>2. Fire an alert (PagerDuty, Slack, metric increment)</li>
+     *   <li>3. Provide an admin endpoint to replay or discard the record</li>
+     * </ol>
      *
      * This implementation logs all DLT headers so the failure is fully observable.
      */
