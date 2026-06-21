@@ -1,4 +1,7 @@
 spring:
+  application:
+    name: consumer
+
   kafka:
     # Top-level bootstrap-servers is inherited by both the ConsumerFactory
     # and the ProducerFactory (used by DeadLetterPublishingRecoverer).
@@ -50,3 +53,31 @@ spring:
 
 server:
   port: 8082
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+  otlp:
+    metrics:
+      export:
+        url: http://otel-collector:4318/v1/metrics
+        enabled: true
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: http://otel-collector:4318/v1/traces
+    logging:
+      export:
+        otlp:
+          endpoint: http://otel-collector:4318/v1/logs
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: true

@@ -90,6 +90,7 @@ public class KafkaConsumerConfig {
         factory.setConcurrency(3);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
         factory.getContainerProperties().setPollTimeout(3_000);
+        factory.getContainerProperties().setObservationEnabled(true);
         return factory;
     }
 }

@@ -8,7 +8,7 @@ services:
 
   # ─── Broker 1 ────────────────────────────────────────────────────────────────
   kafka-1:
-    image: confluentinc/cp-kafka:7.8.0
+    image: confluentinc/cp-kafka:8.0.3
     hostname: kafka-1
     container_name: kafka-1
     ports:
@@ -72,7 +72,7 @@ services:
 
   # ─── Broker 2 ────────────────────────────────────────────────────────────────
   kafka-2:
-    image: confluentinc/cp-kafka:7.8.0
+    image: confluentinc/cp-kafka:8.0.3
     hostname: kafka-2
     container_name: kafka-2
     ports:
@@ -118,7 +118,7 @@ services:
 
   # ─── Broker 3 ────────────────────────────────────────────────────────────────
   kafka-3:
-    image: confluentinc/cp-kafka:7.8.0
+    image: confluentinc/cp-kafka:8.0.3
     hostname: kafka-3
     container_name: kafka-3
     ports:
@@ -167,7 +167,7 @@ services:
   # Producers register schemas; consumers validate against them — preventing
   # schema drift from breaking downstream consumers.
   schema-registry:
-    image: confluentinc/cp-schema-registry:7.8.0
+    image: confluentinc/cp-schema-registry:8.0.3
     hostname: schema-registry
     container_name: schema-registry
     depends_on:
@@ -192,6 +192,111 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+
+  # ─── Kafka Exporter ──────────────────────────────────────────────────────────
+  # Exposes consumer-group lag and topic offset metrics via Kafka protocol (no JMX).
+  # Prometheus scrapes this at :9308/metrics.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    command:
+      - "--kafka.server=kafka-1:29092"
+      - "--kafka.server=kafka-2:29092"
+      - "--kafka.server=kafka-3:29092"
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+    networks:
+      - kafka-network
+
+  # ─── OpenTelemetry Collector ─────────────────────────────────────────────────
+  # Receives OTLP from both Spring Boot apps (metrics + traces), exposes a
+  # Prometheus scrape endpoint at :8889, and forwards traces to Jaeger.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otelcol-contrib/config.yml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver (apps → collector)
+      - "4318:4318"   # OTLP HTTP receiver (apps → collector)
+      - "8889:8889"   # Prometheus exporter (collector → Prometheus)
+    networks:
+      - kafka-network
+
+  # ─── Grafana Tempo ────────────────────────────────────────────────────────────
+  # Trace backend — receives traces from otel-collector via OTLP.
+  # Grafana queries Tempo at http://tempo:3200 using the Tempo data source.
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./tempo-config.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API (Grafana data source)
+    networks:
+      - kafka-network
+
+  # ─── Grafana Loki ─────────────────────────────────────────────────────────────
+  # Log backend — receives logs from otel-collector via OTLP HTTP.
+  # Grafana queries Loki at http://loki:3100 using the Loki data source.
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"   # Loki HTTP API (Grafana data source)
+    networks:
+      - kafka-network
+
+  # ─── Prometheus ───────────────────────────────────────────────────────────────
+  # Scrapes kafka-exporter (broker/consumer-group lag) and otel-collector
+  # (app metrics forwarded from Spring Boot via OTLP push).
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - kafka-exporter
+      - otel-collector
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - kafka-network
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  # Dashboard UI at http://localhost:3000  (admin / admin)
+  # Import dashboard ID 7589 (Kafka Exporter Overview) and 12900 (JVM Micrometer).
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - kafka-network
 
   # ─── Kafka UI ─────────────────────────────────────────────────────────────────
   # Web UI for browsing topics, consumer groups, offsets, and schemas.
@@ -226,3 +331,6 @@ volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
+  prometheus-data:
+  grafana-data:
+  tempo-data:

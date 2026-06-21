@@ -28,6 +28,10 @@ Production-grade Kafka integration built on a real-world use case: streaming liv
 6. [Project Structure](#project-structure)
 7. [Infrastructure](#infrastructure)
 8. [Getting Started](#getting-started)
+   - [Step 5 — Explore Kafka UI](#step-5--explore-kafka-ui)
+   - [Step 6 — Observe with OpenTelemetry](#step-6--observe-with-opentelemetry)
+   - [Step 7 — Simulate a DLT failure](#step-7--simulate-a-dlt-failure)
+   - [Step 8 — Browse the H2 database](#step-8--browse-the-h2-database)
 9. [Configuration Reference](#configuration-reference)
 10. [Production Checklist](#production-checklist)
 
@@ -385,40 +389,49 @@ This project currently uses plain String serialization. Migrating to Avro + Sche
 
 ```
 kafka-springboot/
-├── docker-compose.yml              # 3-broker KRaft cluster + Schema Registry + Kafka UI
+├── docker-compose.yml              # 3-broker KRaft cluster + observability stack
+├── prometheus.yml                  # Prometheus scrape config (kafka-exporter + otel-collector)
+├── otel-collector-config.yml       # OTel Collector pipelines (metrics → Prometheus, traces → Tempo, logs → Loki)
+├── tempo-config.yml                # Grafana Tempo local storage config
 │
 ├── producer/                       # Spring Boot :8081 — reads Wikimedia SSE, publishes to Kafka
 │   └── src/main/
 │       ├── java/com/javaguy/producer/
+│       │   ├── InstallOpenTelemetryAppender.java # wires Logback → OTel SDK at startup
 │       │   ├── config/
-│       │   │   ├── WebClientConfig.java         # WebClient bean
-│       │   │   └── WikimediaTopicConfig.java    # wikimedia-stream (3P / RF3 / min-ISR 2)
+│       │   │   ├── WebClientConfig.java          # WebClient bean
+│       │   │   └── WikimediaTopicConfig.java     # wikimedia-stream (3P / RF3 / min-ISR 2)
 │       │   ├── controller/
-│       │   │   └── WikimediaController.java     # GET /api/v1/wikimedia → starts stream
+│       │   │   └── WikimediaController.java      # GET /api/v1/wikimedia → starts stream
 │       │   ├── producer/
-│       │   │   └── WikimediaProducer.java       # KafkaTemplate with send callback
+│       │   │   └── WikimediaProducer.java        # KafkaTemplate with send callback
 │       │   └── stream/
-│       │       └── WikimediaStreamConsumer.java # SSE → ServerSentEvent decoder → Kafka
-│       └── resources/application.yml            # acks=all, idempotent, snappy, linger=20ms
+│       │       └── WikimediaStreamConsumer.java  # SSE → ServerSentEvent decoder → Kafka
+│       └── resources/
+│           ├── application.yml                   # Kafka + OTel OTLP endpoints
+│           └── logback-spring.xml                # routes logs to OTel appender
 │
 └── consumer/                       # Spring Boot :8082 — consumes, persists, exposes REST API
     └── src/main/
         ├── java/com/javaguy/consumer/
+        │   ├── InstallOpenTelemetryAppender.java # wires Logback → OTel SDK at startup
         │   ├── config/
-        │   │   ├── KafkaConsumerConfig.java     # DefaultErrorHandler + DLT recoverer + factory
-        │   │   └── WikimediaTopicConfig.java    # wikimedia-stream + wikimedia-stream.dlt topics
+        │   │   ├── KafkaConsumerConfig.java      # DefaultErrorHandler + DLT recoverer + factory
+        │   │   └── WikimediaTopicConfig.java     # wikimedia-stream + wikimedia-stream.dlt topics
         │   ├── consumer/
-        │   │   ├── WikimediaConsumer.java        # parse JSON → persist → manual ack
-        │   │   └── WikimediaDltConsumer.java     # DLT listener — logs all diagnostic headers
+        │   │   ├── WikimediaConsumer.java         # parse JSON → persist → manual ack
+        │   │   └── WikimediaDltConsumer.java      # DLT listener — logs all diagnostic headers
         │   ├── controller/
-        │   │   └── WikimediaEventController.java # REST: /events, /recent, /wiki/{w}, /stats
+        │   │   └── WikimediaEventController.java  # REST: /events, /recent, /wiki/{w}, /stats
         │   ├── dto/
-        │   │   └── WikimediaEventDto.java        # Jackson record — maps Wikimedia JSON fields
+        │   │   └── WikimediaEventDto.java         # Jackson record — maps Wikimedia JSON fields
         │   ├── entity/
-        │   │   └── WikimediaEvent.java           # JPA entity with Kafka provenance columns
+        │   │   └── WikimediaEvent.java            # JPA entity with Kafka provenance columns
         │   └── repository/
-        │       └── WikimediaEventRepository.java # Spring Data JPA + aggregation queries
-        └── resources/application.yml             # Kafka + H2 + JPA config
+        │       └── WikimediaEventRepository.java  # Spring Data JPA + aggregation queries
+        └── resources/
+            ├── application.yml                    # Kafka + H2 + JPA + OTel OTLP endpoints
+            └── logback-spring.xml                 # routes logs to OTel appender
 ```
 
 ---
@@ -434,8 +447,40 @@ kafka-springboot/
 | kafka-3 | 9094 | broker + controller | 3 |
 | schema-registry | 8085 | schema store | — |
 | kafka-ui | 8080 | management UI | — |
+| kafka-exporter | 9308 | Prometheus metrics exporter (consumer lag, topic offsets via Kafka API) | — |
+| otel-collector | 4317 / 4318 | OTLP receiver — accepts metrics, traces, and logs pushed by both Spring Boot apps | — |
+| prometheus | 9090 | metrics store — scrapes kafka-exporter and otel-collector Prometheus exporter | — |
+| tempo | 3200 | trace backend (Grafana Tempo) | — |
+| loki | 3100 | log backend (Grafana Loki) | — |
+| grafana | 3000 | dashboard UI — queries Prometheus, Tempo, and Loki | — |
 
 All services share the `kafka-network` Docker bridge network. Inter-broker traffic flows over the internal `PLAINTEXT` listener on port 29092 (invisible to the host). Controller Raft consensus uses port 29093. Your Spring Boot apps connect to the `PLAINTEXT_HOST` listeners at `localhost:9092,9093,9094`.
+
+### Observability Signal Flow
+
+```mermaid
+flowchart LR
+    subgraph Apps["Spring Boot Apps"]
+        P["Producer :8081"]
+        C["Consumer :8082"]
+    end
+
+    subgraph Collector["OTel Collector :4318"]
+        M["metrics pipeline"]
+        T["traces pipeline"]
+        L["logs pipeline"]
+    end
+
+    P & C -->|"OTLP HTTP push"| Collector
+
+    M --> Prom["Prometheus :9090"]
+    T --> Tempo["Tempo :3200"]
+    L --> Loki["Loki :3100"]
+
+    KE["kafka-exporter :9308\nconsumer lag · topic offsets"] -->|"Prometheus pull"| Prom
+
+    Prom & Tempo & Loki --> Grafana["Grafana :3000"]
+```
 
 ### Listener Architecture
 
@@ -482,7 +527,7 @@ flowchart TD
 ### Prerequisites
 
 - Docker ≥ 24 and Docker Compose v2
-- Java 21+
+- Java 25 (project target; Spring Boot 4.x minimum is Java 21)
 - Maven 3.9+
 
 ---
@@ -604,14 +649,107 @@ Open **http://localhost:8080** in a browser.
 - *Consumers*: shows `wikimedia-consumer-group` with per-partition lag. Lag should stay near 0 while the consumer is running.
 
 **Topics → wikimedia-stream.dlt**
-- Empty under normal operation. Messages appear here only after all retries are exhausted (see Step 6).
+- Empty under normal operation. Messages appear here only after all retries are exhausted (see Step 7).
 
 **Consumer Groups → wikimedia-consumer-group**
 - Shows which partition is assigned to which consumer thread and current lag across all partitions.
 
 ---
 
-### Step 6 — Simulate a DLT failure
+### Step 6 — Observe with OpenTelemetry
+
+Both Spring Boot apps use `spring-boot-starter-opentelemetry` (Spring Boot 4 first-party observability) to push all three signals — **metrics**, **traces**, and **logs** — to the OTel Collector via OTLP HTTP. Everything starts automatically with `docker compose up -d`.
+
+#### Signal routing
+
+| Signal | From | Via | To | View in |
+|---|---|---|---|---|
+| Metrics | both apps (OTLP push) | otel-collector → Prometheus exporter | Prometheus :9090 | Grafana |
+| Metrics | kafka-exporter (Prometheus pull) | — | Prometheus :9090 | Grafana |
+| Traces | both apps (OTLP push) | otel-collector | Tempo :3200 | Grafana → Explore → Tempo |
+| Logs | both apps (OTLP push via Logback appender) | otel-collector | Loki :3100 | Grafana → Explore → Loki |
+
+#### Spring Boot Actuator endpoints
+
+Both services still expose health and metrics endpoints (replace `8081` with `8082` for the consumer):
+
+| Endpoint | URL | What it shows |
+|---|---|---|
+| Health | `http://localhost:8081/actuator/health` | Liveness, readiness, Kafka connectivity |
+| Metrics index | `http://localhost:8081/actuator/metrics` | All registered metric names |
+| Single metric | `http://localhost:8081/actuator/metrics/kafka.producer.record.send.total` | One metric with tags |
+
+#### Prometheus — Kafka metrics
+
+Open **http://localhost:9090/targets** — both jobs should show `UP`:
+
+| Job | Source | What it collects |
+|---|---|---|
+| `kafka-exporter` | Prometheus pull from `:9308` | Consumer group lag, topic partition offsets |
+| `otel-collector` | Prometheus pull from `:8889` | JVM, HTTP, Kafka client metrics from both apps |
+
+Useful PromQL queries at **http://localhost:9090/graph**:
+
+```promql
+# Consumer group lag per partition — the key operational alert metric
+kafka_consumergroup_lag{consumergroup="wikimedia-consumer-group"}
+
+# Total lag across all partitions
+kafka_consumergroup_lag_sum{consumergroup="wikimedia-consumer-group"}
+
+# Current write-head offset per partition (proxy for producer throughput)
+kafka_topic_partition_current_offset{topic="wikimedia-stream"}
+
+# JVM heap used by the consumer
+jvm_memory_used_bytes{job="otel-collector", area="heap"}
+
+# HTTP request rate on the consumer REST API
+rate(http_server_requests_seconds_count{job="otel-collector"}[1m])
+```
+
+#### Grafana — set up data sources and dashboards
+
+1. Open **http://localhost:3000** and log in with `admin` / `admin`.
+2. Go to **Connections → Data Sources** and add all three:
+
+   | Name | Type | URL |
+   |---|---|---|
+   | Prometheus | Prometheus | `http://prometheus:9090` |
+   | Tempo | Tempo | `http://tempo:3200` |
+   | Loki | Loki | `http://loki:3100` |
+
+3. In the **Tempo** data source settings, enable **Trace to logs** and link it to your Loki source — this lets you jump from a trace span directly to the logs that fired at the same moment.
+
+4. Import pre-built dashboards (**Dashboards → Import**):
+   - ID **7589** — *Kafka Exporter Overview* (consumer lag, topic offsets, partition leaders)
+   - ID **12900** — *JVM (Micrometer)* (heap, GC, thread count, HTTP rates)
+
+#### Tempo — exploring traces
+
+Go to **Explore → Tempo** and search by service name `producer` or `consumer`. Each Kafka listener invocation, HTTP request, and JDBC call appears as a span. You can see the full call chain from HTTP request → Kafka consume → database write on a single waterfall trace.
+
+#### Loki — querying logs
+
+Go to **Explore → Loki** and run:
+
+```logql
+# All logs from the consumer service
+{service_name="consumer"}
+
+# Only ERROR-level logs across both services
+{service_name=~"producer|consumer"} | json | level="ERROR"
+
+# DLT failures specifically
+{service_name="consumer"} |= "DLT"
+```
+
+Logs include the OTel `traceId` field automatically, so clicking a log line lets you jump straight to the matching trace in Tempo.
+
+After the consumer is running and lag reaches zero, stop it temporarily and watch the `kafka_consumergroup_lag` metric climb in Grafana in real time — then restart it and watch the lag drain.
+
+---
+
+### Step 7 — Simulate a DLT failure
 
 To see the dead-letter flow in action, temporarily make the consumer throw on a record by adding one line to `WikimediaConsumer.consume()`:
 
@@ -648,7 +786,7 @@ Remove the throw and restart to return to normal operation.
 
 ---
 
-### Step 7 — Browse the H2 database
+### Step 8 — Browse the H2 database
 
 Open **http://localhost:8082/h2-console** in a browser.
 
@@ -772,6 +910,30 @@ docker exec kafka-1 kafka-consumer-groups \
 | `retention.bytes` | `10737418240` | Cap at 10 GiB per partition |
 | `compression.type` | `snappy` | Consistent with producer setting |
 
+### OpenTelemetry Properties (both `application.yml` files)
+
+Spring Boot 4's `spring-boot-starter-opentelemetry` is configured entirely through `management.*` properties. The same keys apply to both producer and consumer — only the service name differs.
+
+> **Dependency note:** `spring-boot-starter-opentelemetry` does **not** pull in the Logback bridge transitively in Spring Boot 4.x. Both modules declare it explicitly with compile scope so that `InstallOpenTelemetryAppender` can reference it at compile time:
+> ```xml
+> <dependency>
+>     <groupId>io.opentelemetry.instrumentation</groupId>
+>     <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+>     <version>2.29.0-alpha</version>
+> </dependency>
+> ```
+
+| Property | Value | Signal |
+|---|---|---|
+| `management.otlp.metrics.export.url` | `http://otel-collector:4318/v1/metrics` | Metrics |
+| `management.otlp.metrics.export.enabled` | `true` | Metrics |
+| `management.opentelemetry.tracing.export.otlp.endpoint` | `http://otel-collector:4318/v1/traces` | Traces |
+| `management.opentelemetry.logging.export.otlp.endpoint` | `http://otel-collector:4318/v1/logs` | Logs |
+| `management.tracing.sampling.probability` | `1.0` | Traces (100% sampling) |
+| `management.tracing.export.enabled` | `true` | Traces |
+
+> All three signals share OTLP HTTP on port **4318**. The OTel Collector (`otel-collector-config.yml`) fans them out: metrics → Prometheus exporter `:8889`, traces → Tempo `:3200`, logs → Loki `:3100`.
+
 ---
 
 ## Production Checklist
@@ -781,7 +943,7 @@ docker exec kafka-1 kafka-consumer-groups \
 - [ ] **Authorization.** Kafka ACLs (`kafka-acls`) or Confluent RBAC restrict which clients can produce/consume which topics.
 - [ ] **Dedicated controller nodes.** For clusters handling > 5 k partitions, separate controller-only nodes (`KAFKA_PROCESS_ROLES: controller`) from broker-only nodes to isolate Raft I/O from data I/O.
 - [ ] **JVM heap sizing.** Each broker typically runs with `-Xms6g -Xmx6g`. The OS page cache does the heavy lifting — don't give Kafka too much heap.
-- [ ] **Monitoring.** Export JMX metrics (ports 9101–9103) to Prometheus via `jmx-exporter` and build dashboards for: under-replicated partitions, consumer group lag, request latency p99, disk utilisation.
+- [x] **Monitoring.** Both apps push metrics, traces, and logs via OTLP to the OTel Collector. Prometheus scrapes the collector for PromQL queries. Grafana Tempo stores traces; Grafana Loki stores logs. `kafka-exporter` provides consumer group lag and topic offset metrics. See [Observe with OpenTelemetry](#step-6--observe-with-opentelemetry).
 - [ ] **Log directories on fast disks.** Kafka is I/O bound. Use dedicated NVMe volumes for `KAFKA_LOG_DIRS`. Separate OS disk from data disk.
 - [ ] **Retention tuning.** Set `retention.ms` and `retention.bytes` per-topic based on downstream replay requirements, not just capacity.
 - [ ] **Consumer lag alerting.** Alert when `consumer group lag > threshold` — it means consumers are falling behind producers.
