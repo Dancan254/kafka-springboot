@@ -62,20 +62,23 @@ management:
   endpoint:
     health:
       show-details: always
+  # The collector is reachable at localhost:4318 when this app runs on the host
+  # (the port is published by docker compose). Running the app inside the compose
+  # network instead? Set OTEL_COLLECTOR_URL=http://otel-collector:4318.
   otlp:
     metrics:
       export:
-        url: http://otel-collector:4318/v1/metrics
+        url: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/metrics
         enabled: true
   opentelemetry:
     tracing:
       export:
         otlp:
-          endpoint: http://otel-collector:4318/v1/traces
+          endpoint: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/traces
     logging:
       export:
         otlp:
-          endpoint: http://otel-collector:4318/v1/logs
+          endpoint: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/logs
   tracing:
     sampling:
       probability: 1.0

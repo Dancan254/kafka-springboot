@@ -20,8 +20,6 @@ public class WikimediaStreamConsumer {
     }
 
     public void consumeStreamAndPublish() {
-        // Use the SSE decoder so WebClient parses the "data: {...}" framing and
-        // hands us the raw JSON payload — no SSE protocol noise reaches Kafka.
         webClient.get()
                 .uri("/stream/recentchange")
                 .retrieve()

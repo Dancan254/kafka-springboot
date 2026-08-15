@@ -133,7 +133,7 @@ services:
       KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
       KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-3:29092,PLAINTEXT_HOST://localhost:9094'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA__LISTENER_NAMES: ''
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
@@ -235,7 +235,7 @@ services:
   # Trace backend — receives traces from otel-collector via OTLP.
   # Grafana queries Tempo at http://tempo:3200 using the Tempo data source.
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.10.4
     container_name: tempo
     command: ["-config.file=/etc/tempo/tempo.yml"]
     volumes:

@@ -1,7 +1,5 @@
 package com.javaguy.consumer.consumer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.javaguy.consumer.dto.WikimediaEventDto;
 import com.javaguy.consumer.entity.WikimediaEvent;
 import com.javaguy.consumer.repository.WikimediaEventRepository;
@@ -11,6 +9,8 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
 
 import java.time.LocalDateTime;
 
@@ -58,7 +58,7 @@ public class WikimediaConsumer {
     private WikimediaEventDto parse(ConsumerRecord<String, String> record) {
         try {
             return objectMapper.readValue(record.value(), WikimediaEventDto.class);
-        } catch (JsonProcessingException e) {
+        } catch (JacksonException e) {
             // Malformed JSON will never parse correctly no matter how many retries.
             // Wrapping in IllegalArgumentException triggers the non-retryable path in
             // DefaultErrorHandler and routes the record straight to wikimedia-stream.dlt.
