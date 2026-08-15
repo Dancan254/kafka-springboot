@@ -1,327 +1,70 @@
-version: '3.8'
-
-# Three brokers run in combined mode (broker + controller roles on every node),
-# giving you a proper quorum so you can observe leader election, ISR shrinkage,
-# and partition reassignment without external coordination.
+name: kafka-course
 
 services:
 
-  # ─── Broker 1 ────────────────────────────────────────────────────────────────
   kafka-1:
-    image: confluentinc/cp-kafka:8.0.3
+    image: confluentinc/cp-kafka:8.2.2
     hostname: kafka-1
     container_name: kafka-1
     ports:
-      - "9092:9092"   # external client access
-      - "9101:9101"   # JMX metrics
+      - "9092:9092"
     environment:
-      # KRaft identity
+      # KRaft identity. One node, acting as both broker and controller.
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: 'broker,controller'
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093'
 
-      # Quorum voters — all three nodes participate in Raft leader election
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
-
-      # Listener config:
-      #   PLAINTEXT      → inter-broker traffic (Docker internal network)
-      #   CONTROLLER     → Raft / metadata replication
-      #   PLAINTEXT_HOST → external clients on the host machine
+      # Three listeners, three jobs:
+      #   PLAINTEXT_HOST  clients on your machine, via the published port 9092
+      #   PLAINTEXT       broker-to-broker traffic inside the Docker network
+      #   CONTROLLER      Raft metadata traffic between controllers
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
       KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
       KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://localhost:9092'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
 
-      # Replication — production minimum is RF=3, min ISR=2
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
+      # One broker can hold only one copy of anything, so every replication
+      # factor here is 1. Lesson 06 raises them.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
       KAFKA_NUM_PARTITIONS: 3
 
-      # Log retention (7-day default; segment rolled at 1 GiB)
+      # Keep records for 7 days.
       KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
 
-      # Network & I/O threads — tune for throughput vs. latency trade-off
-      KAFKA_NUM_NETWORK_THREADS: 3
-      KAFKA_NUM_IO_THREADS: 8
-      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
-
-      # Consumer group rebalance — set to 0 for fast dev restarts (increase in prod)
+      # No artificial delay before a consumer group rebalances. Convenient
+      # locally, too aggressive for production.
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-
-      # JMX
-      KAFKA_JMX_PORT: 9101
-      KAFKA_JMX_HOSTNAME: localhost
     volumes:
       - kafka-1-data:/var/lib/kafka/data
     networks:
       - kafka-network
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 20s
 
-  # ─── Broker 2 ────────────────────────────────────────────────────────────────
-  kafka-2:
-    image: confluentinc/cp-kafka:8.0.3
-    hostname: kafka-2
-    container_name: kafka-2
-    ports:
-      - "9093:9092"   # host:9093 → container:9092
-      - "9102:9102"
-    environment:
-      KAFKA_NODE_ID: 2
-      KAFKA_PROCESS_ROLES: 'broker,controller'
-      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-2:29092,PLAINTEXT_HOST://localhost:9093'
-      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
-      KAFKA_NUM_NETWORK_THREADS: 3
-      KAFKA_NUM_IO_THREADS: 8
-      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_JMX_PORT: 9102
-      KAFKA_JMX_HOSTNAME: localhost
-    volumes:
-      - kafka-2-data:/var/lib/kafka/data
-    networks:
-      - kafka-network
-    healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  # ─── Broker 3 ────────────────────────────────────────────────────────────────
-  kafka-3:
-    image: confluentinc/cp-kafka:8.0.3
-    hostname: kafka-3
-    container_name: kafka-3
-    ports:
-      - "9094:9092"   # host:9094 → container:9092
-      - "9103:9103"
-    environment:
-      KAFKA_NODE_ID: 3
-      KAFKA_PROCESS_ROLES: 'broker,controller'
-      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-3:29092,PLAINTEXT_HOST://localhost:9094'
-      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA__LISTENER_NAMES: ''
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_IN_SYNC_REPLICAS: 2
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_SEGMENT_BYTES: 1073741824
-      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
-      KAFKA_NUM_NETWORK_THREADS: 3
-      KAFKA_NUM_IO_THREADS: 8
-      KAFKA_SOCKET_SEND_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: 102400
-      KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_JMX_PORT: 9103
-      KAFKA_JMX_HOSTNAME: localhost
-    volumes:
-      - kafka-3-data:/var/lib/kafka/data
-    networks:
-      - kafka-network
-    healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  # ─── Schema Registry ─────────────────────────────────────────────────────────
-  # Centralized schema store for Avro / Protobuf / JSON Schema contracts.
-  # Producers register schemas; consumers validate against them — preventing
-  # schema drift from breaking downstream consumers.
-  schema-registry:
-    image: confluentinc/cp-schema-registry:8.0.3
-    hostname: schema-registry
-    container_name: schema-registry
-    depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    ports:
-      - "8085:8081"   # http://localhost:8085 — avoids conflict with Spring apps
-    environment:
-      SCHEMA_REGISTRY_HOST_NAME: schema-registry
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka-1:29092,kafka-2:29092,kafka-3:29092'
-      SCHEMA_REGISTRY_LISTENERS: 'http://0.0.0.0:8081'
-      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
-    networks:
-      - kafka-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  # ─── Kafka Exporter ──────────────────────────────────────────────────────────
-  # Exposes consumer-group lag and topic offset metrics via Kafka protocol (no JMX).
-  # Prometheus scrapes this at :9308/metrics.
-  kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
-    container_name: kafka-exporter
-    command:
-      - "--kafka.server=kafka-1:29092"
-      - "--kafka.server=kafka-2:29092"
-      - "--kafka.server=kafka-3:29092"
-    depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    ports:
-      - "9308:9308"
-    networks:
-      - kafka-network
-
-  # ─── OpenTelemetry Collector ─────────────────────────────────────────────────
-  # Receives OTLP from both Spring Boot apps (metrics + traces), exposes a
-  # Prometheus scrape endpoint at :8889, and forwards traces to Jaeger.
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
-    container_name: otel-collector
-    command: ["--config=/etc/otelcol-contrib/config.yml"]
-    volumes:
-      - ./otel-collector-config.yml:/etc/otelcol-contrib/config.yml:ro
-    ports:
-      - "4317:4317"   # OTLP gRPC receiver (apps → collector)
-      - "4318:4318"   # OTLP HTTP receiver (apps → collector)
-      - "8889:8889"   # Prometheus exporter (collector → Prometheus)
-    networks:
-      - kafka-network
-
-  # ─── Grafana Tempo ────────────────────────────────────────────────────────────
-  # Trace backend — receives traces from otel-collector via OTLP.
-  # Grafana queries Tempo at http://tempo:3200 using the Tempo data source.
-  tempo:
-    image: grafana/tempo:2.10.4
-    container_name: tempo
-    command: ["-config.file=/etc/tempo/tempo.yml"]
-    volumes:
-      - ./tempo-config.yml:/etc/tempo/tempo.yml:ro
-      - tempo-data:/var/tempo
-    ports:
-      - "3200:3200"   # Tempo HTTP API (Grafana data source)
-    networks:
-      - kafka-network
-
-  # ─── Grafana Loki ─────────────────────────────────────────────────────────────
-  # Log backend — receives logs from otel-collector via OTLP HTTP.
-  # Grafana queries Loki at http://loki:3100 using the Loki data source.
-  loki:
-    image: grafana/loki:latest
-    container_name: loki
-    command: ["-config.file=/etc/loki/local-config.yaml"]
-    ports:
-      - "3100:3100"   # Loki HTTP API (Grafana data source)
-    networks:
-      - kafka-network
-
-  # ─── Prometheus ───────────────────────────────────────────────────────────────
-  # Scrapes kafka-exporter (broker/consumer-group lag) and otel-collector
-  # (app metrics forwarded from Spring Boot via OTLP push).
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.enable-lifecycle"
-    depends_on:
-      - kafka-exporter
-      - otel-collector
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    networks:
-      - kafka-network
-
-  # ─── Grafana ──────────────────────────────────────────────────────────────────
-  # Dashboard UI at http://localhost:3000  (admin / admin)
-  # Import dashboard ID 7589 (Kafka Exporter Overview) and 12900 (JVM Micrometer).
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    depends_on:
-      - prometheus
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - grafana-data:/var/lib/grafana
-    networks:
-      - kafka-network
-
-  # ─── Kafka UI ─────────────────────────────────────────────────────────────────
-  # Web UI for browsing topics, consumer groups, offsets, and schemas.
-  # Access at http://localhost:8080
   kafka-ui:
-    image: provectuslabs/kafka-ui:latest
+    image: kafbat/kafka-ui:v1.5.0
+    hostname: kafka-ui
     container_name: kafka-ui
-    depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-      schema-registry:
-        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local-kraft-cluster
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'kafka-1:29092,kafka-2:29092,kafka-3:29092'
-      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: 'http://schema-registry:8081'
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'kafka-1:29092'
       DYNAMIC_CONFIG_ENABLED: 'true'
     networks:
       - kafka-network
+    depends_on:
+      kafka-1:
+        condition: service_healthy
 
 networks:
   kafka-network:
@@ -329,8 +72,3 @@ networks:
 
 volumes:
   kafka-1-data:
-  kafka-2-data:
-  kafka-3-data:
-  prometheus-data:
-  grafana-data:
-  tempo-data:
