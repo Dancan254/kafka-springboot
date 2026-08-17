@@ -126,7 +126,7 @@ name: kafka-course
 services:
 
   kafka-1:
-    image: confluentinc/cp-kafka:8.2.2
+    image: confluentinc/cp-kafka:8.3.1
     hostname: kafka-1
     container_name: kafka-1
     ports:
@@ -209,7 +209,7 @@ Five things in that file are worth understanding rather than copying.
 
 **The `healthcheck` is not decoration.** `kafka-ui` depends on it through `condition: service_healthy`, so the UI will not start until the broker actually answers an API request. Step 5 explains why that distinction matters.
 
-Two smaller details you will need later. `name: kafka-course` at the top sets the Compose project name, which is what prefixes the resources Compose creates: the network becomes `kafka-course_kafka-network` and the volume `kafka-course_kafka-1-data`. And `confluentinc/cp-kafka:8.2.2` is Confluent's distribution of **Kafka 4.2**; it is used here rather than the `apache/kafka` image because it puts the `kafka-topics`, `kafka-console-producer` and related scripts on the container's `PATH`, which every command in Part 1 relies on.
+Two smaller details you will need later. `name: kafka-course` at the top sets the Compose project name, which is what prefixes the resources Compose creates: the network becomes `kafka-course_kafka-network` and the volume `kafka-course_kafka-1-data`. And `confluentinc/cp-kafka:8.3.1` is Confluent's distribution of **Kafka 4.x**; it is used here rather than the `apache/kafka` image because it puts the `kafka-topics`, `kafka-console-producer` and related scripts on the container's `PATH`, which every command in Part 1 relies on.
 
 ### 4. Start it
 
@@ -231,7 +231,7 @@ Wait until you see this:
 
 ```
 NAME       IMAGE                         COMMAND                  SERVICE    CREATED          STATUS                    PORTS
-kafka-1    confluentinc/cp-kafka:8.2.2   "/etc/confluent/dock…"   kafka-1    27 seconds ago   Up 27 seconds (healthy)   0.0.0.0:9092->9092/tcp
+kafka-1    confluentinc/cp-kafka:8.3.1   "/etc/confluent/dock…"   kafka-1    27 seconds ago   Up 27 seconds (healthy)   0.0.0.0:9092->9092/tcp
 kafka-ui   kafbat/kafka-ui:v1.5.0        "/bin/sh -c 'java --…"   kafka-ui   27 seconds ago   Up 9 seconds              0.0.0.0:8080->8080/tcp
 ```
 
@@ -274,7 +274,7 @@ If `LeaderId` is `-1`, no controller was elected. With a single node that almost
 
 Browse to **http://localhost:8080**.
 
-You should see one cluster, `local-kraft-cluster`, marked **Online** with a broker count of 1 and a version of `4.2-IV1`. If the page loads but reports the cluster offline, the UI connected before the broker finished starting; wait 20 seconds and refresh.
+You should see one cluster, `local-kraft-cluster`, marked **Online** with a broker count of 1 and a metadata version such as `4.2-IV1`. If the page loads but reports the cluster offline, the UI connected before the broker finished starting; wait 20 seconds and refresh.
 
 Lesson 02 is a full tour of this interface. For now, its existence is the confirmation you need.
 
@@ -315,10 +315,10 @@ Use `stop` and `start` between lessons. Use `down -v` only when a lesson tells y
 3. Two commands that both look correct and both fail. Run each and read the error:
 
    ```bash
-   docker run --rm confluentinc/cp-kafka:8.2.2 \
+   docker run --rm confluentinc/cp-kafka:8.3.1 \
      kafka-broker-api-versions --bootstrap-server kafka-1:29092
 
-   docker run --rm --network kafka-course_kafka-network confluentinc/cp-kafka:8.2.2 \
+   docker run --rm --network kafka-course_kafka-network confluentinc/cp-kafka:8.3.1 \
      kafka-broker-api-versions --bootstrap-server localhost:9092
    ```
 

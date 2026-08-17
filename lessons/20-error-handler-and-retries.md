@@ -1,31 +1,29 @@
-# Lesson 20 — `DefaultErrorHandler` & Retries
+# Lesson 20: DefaultErrorHandler and Retries
 
-> **Part 4 — Resilience** · 30 minutes
+> **Part 4: Resilience**
 
 ---
 
 ## What you'll learn
 
-- What Spring's `DefaultErrorHandler` does when your listener throws
-- How `ExponentialBackOff` produces a bounded retry schedule, and how `maxElapsedTime` ends it
-- Why retrying a malformed record is not just useless but harmful
-- How to classify exceptions as retryable or fatal, and why the classification is a design decision
+- What the container does when your listener throws, with no configuration at all
+- How `ExponentialBackOff` decides when to stop, which is not what it looks like
+- Why some exceptions must never be retried, and how the handler learns which
+- Why a retry blocks one partition and not the others
 
 ---
 
 ## Why this matters
 
-In Lesson 16 you produced `this is not json` to the topic and watched the consumer retry it forever, ten times a second, blocking the partition. Every valid record behind it waited. Your only escape was resetting the group's offsets and skipping *everything* pending.
+Lesson 16 produced a malformed record and watched one partition stop forever. Lesson 18 made a database failure redeliver in a tight loop. Both are the same missing piece: nothing decides how many times to try, how long to wait, or what to do when trying is pointless.
 
-That's the poison-pill problem, and it is the single most common way a Kafka consumer goes down in production. The record is not corrupt — Kafka stored exactly what the producer sent. Your code simply cannot process it, and will never be able to.
-
-This lesson gives you the retry policy. The next one gives you somewhere to put the records that survive it.
+This is also where a decision you made three lessons ago pays off. The exception type you chose in Lesson 16 is the routing rule this lesson reads.
 
 ---
 
 ## Before you start
 
-[Lesson 19](19-concurrency-and-rebalancing.md). A consumer with `setConcurrency(3)`, manual ack, and JPA persistence.
+[Lesson 19](19-concurrency-and-rebalancing.md), with concurrency set to 3.
 
 ---
 
@@ -33,32 +31,29 @@ This lesson gives you the retry policy. The next one gives you somewhere to put 
 
 ### What happens when your listener throws
 
-The listener container catches the exception and hands the record, plus the exception, to a **`CommonErrorHandler`**.
+The container catches the exception and hands the record, plus the exception, to a `CommonErrorHandler`.
 
-If you configure nothing, you get `DefaultErrorHandler` with default settings: retry the record **9 times with no delay**, then log the failure and skip it. That's the ten-per-second hammering you saw — nine near-instant retries, then it gives up on *that* delivery, but because the offset was never committed, the next `poll()` returns the same record and the cycle begins again.
+Configure nothing and you get `DefaultErrorHandler` with its defaults: retry the record nine times with no delay, then log the failure and skip that delivery. Because the offset was never committed, the next `poll()` returns the same record and the cycle starts again. That is the rapid, endless hammering you saw in Lesson 16.
 
-Two things worth being precise about:
+Two things worth being precise about.
 
-**Retries are seeks, not redeliveries.** The error handler tells the consumer to `seek()` back to the failed record's offset. The next poll returns it again. There's no separate retry queue and no broker involvement.
+**Retries are seeks, not redeliveries.** The error handler tells the consumer to seek back to the failed record's offset, so the next poll returns it again. There is no retry queue and no broker involvement.
 
-**Retries block the partition.** The consumer thread is busy re-processing one record. Everything behind it on that partition waits. With `setConcurrency(3)`, the other two partitions keep flowing — so a poison pill costs you a third of your throughput, not all of it.
+**Retries block the partition.** The consumer thread is busy reprocessing one record, and everything behind it on that partition waits. With concurrency of 3, the other two partitions keep flowing, so a poison pill costs a third of your throughput rather than all of it. That is precisely why it is easy to miss.
 
-### `DefaultErrorHandler`, properly configured
+### `DefaultErrorHandler`
 
 ```java
 var handler = new DefaultErrorHandler(recoverer, backOff);
 ```
 
-Two collaborators:
+Two collaborators. A `BackOff` decides how long to wait between attempts and when to stop, and a recoverer is invoked once retries are exhausted.
 
-- a **`BackOff`** — how long to wait between attempts, and when to stop
-- a **recoverer** — a `BiConsumer<ConsumerRecord, Exception>` invoked once retries are exhausted
+Without a recoverer, an exhausted record is logged and skipped, which means silent data loss with a log line. Lesson 21 supplies a recoverer that publishes it somewhere you can inspect.
 
-Without a recoverer, an exhausted record is logged and skipped. With one — Lesson 21's `DeadLetterPublishingRecoverer` — it's published somewhere you can inspect it.
+> `DefaultErrorHandler` replaced `SeekToCurrentErrorHandler`, which was removed in Spring Kafka 3.0. If a tutorial mentions `SeekToCurrentErrorHandler`, `ErrorHandler` or `BatchErrorHandler`, it predates 2022.
 
-> `DefaultErrorHandler` replaced `SeekToCurrentErrorHandler`, which was removed in Spring Kafka 3.x. If a tutorial mentions `SeekToCurrentErrorHandler` or `ErrorHandler`/`BatchErrorHandler`, it predates 2022.
-
-### `ExponentialBackOff` and the `maxElapsedTime` trick
+### `ExponentialBackOff` and the `maxElapsedTime` surprise
 
 ```java
 var backoff = new ExponentialBackOff(1_000L, 2.0);
@@ -66,47 +61,41 @@ backoff.setMaxInterval(10_000L);
 backoff.setMaxElapsedTime(7_000L);
 ```
 
-`ExponentialBackOff(initialInterval, multiplier)` produces intervals `1s, 2s, 4s, 8s, …`, capped at `maxInterval`.
+`ExponentialBackOff(initialInterval, multiplier)` produces intervals of 1 second, 2 seconds, 4 seconds and so on, capped at `maxInterval`.
 
-`maxElapsedTime` is what stops it — and it works in a way that surprises people. The backoff tracks the **cumulative sum of intervals it has handed out**, not real wall-clock time. Each call to `nextBackOff()` adds to that total. Once the total reaches `maxElapsedTime`, the next call returns `BackOffExecution.STOP`, and the error handler invokes the recoverer.
+`maxElapsedTime` is what stops it, and it works in a way that catches people out. The backoff tracks the **cumulative sum of the intervals it has handed out**, not real elapsed time. Each call adds to that total, and once the total reaches `maxElapsedTime` the next call returns a stop signal and the handler invokes the recoverer.
 
-So `maxElapsedTime = 7_000` gives you exactly:
+So `maxElapsedTime` of 7,000 gives exactly this:
 
 | Attempt | Wait before it | Cumulative |
 |---|---|---|
-| 1 | — (immediate) | 0 |
+| 1 | immediate | 0 |
 | 2 | 1,000 ms | 1,000 |
 | 3 | 2,000 ms | 3,000 |
 | 4 | 4,000 ms | 7,000 |
-| — | `STOP` → recoverer | |
+| none | stop, recoverer runs | |
 
-Four attempts, three retries, `1 + 2 + 4 = 7` seconds of waiting. Change `maxElapsedTime` to `15_000` and you'd get a fifth attempt after another 8 s.
+Four attempts, three retries, seven seconds of waiting. Raise `maxElapsedTime` to 15,000 and you get a fifth attempt after a further 8 seconds.
 
-> The alternative is `ExponentialBackOffWithMaxRetries(3)`, which counts attempts directly and is easier to read. This project uses the `maxElapsedTime` form; both are correct, and knowing that `maxElapsedTime` sums *intervals* rather than measuring elapsed time is the part that catches people out. If your listener takes 30 seconds per attempt, the backoff neither knows nor cares.
+The consequence of it summing intervals rather than measuring time is worth stating: if your listener takes 30 seconds per attempt, the backoff neither knows nor cares. You will get four attempts spread over roughly two minutes, and the name `maxElapsedTime` will have told you nothing useful.
 
-### Retryable vs non-retryable
+`ExponentialBackOffWithMaxRetries(3)` counts attempts directly and is easier to read. Both are correct; this course uses the `maxElapsedTime` form because you will meet it in existing code and the sum-of-intervals behaviour is the part that surprises people.
 
-Here's the crux.
+### Retryable and non-retryable
 
-A retry is a bet that **the same input will produce a different outcome next time**. That bet pays off when the failure was caused by something transient and external:
+Here is the crux of the lesson.
 
-- the database was briefly down
-- a downstream HTTP call timed out
-- the ISR dipped below `min.insync.replicas`
+A retry is a bet that the same input will produce a different outcome next time. That bet pays off when the failure came from something transient and external: the database was briefly down, a downstream call timed out, the ISR dipped below the floor.
 
-It never pays off when the failure is caused by the *record itself*:
+It never pays off when the failure is caused by the record itself: the JSON is malformed, a required field is missing, a value fails validation. The bytes do not change between attempts.
 
-- the JSON is malformed
-- a required field is missing
-- the value fails a business validation rule
-
-The bytes don't change between attempts. Retrying a malformed record four times, waiting seven seconds in the process, blocks the partition for seven seconds and then fails anyway. Retrying it *forever* blocks the partition forever.
+Retrying a malformed record four times blocks the partition for seven seconds and then fails anyway. Retrying it indefinitely blocks the partition indefinitely.
 
 ```java
 handler.addNotRetryableExceptions(IllegalArgumentException.class);
 ```
 
-This tells the handler: when you see this exception type, skip the backoff entirely and go straight to the recoverer.
+That tells the handler to skip the backoff entirely for this exception type and go straight to the recoverer.
 
 Now look back at Lesson 16's parse method:
 
@@ -116,41 +105,35 @@ Now look back at Lesson 16's parse method:
 }
 ```
 
-That wrapping was never cosmetic. It was choosing the exception type that this line will match. `JacksonException` would have been retried; `IllegalArgumentException` is not. **The exception type is the routing decision**, made three lessons before the router existed.
+That wrapping was never cosmetic. It chose the exception type this line matches. `JacksonException` would have been retried; `IllegalArgumentException` is not. The exception type is the routing decision, made three lessons before the router existed.
 
-The classification is a design choice, and it's yours. Kafka has no opinion about whether your exception is worth retrying. Choose deliberately:
+```mermaid
+flowchart TD
+    L["Listener throws"] --> C{"Exception type<br/>registered as<br/>non-retryable?"}
+    C -->|"yes"| R["recoverer immediately"]
+    C -->|"no"| B{"Backoff exhausted?"}
+    B -->|"no"| W["wait, seek back,<br/>attempt again<br/>partition blocked"]
+    W --> L
+    B -->|"yes"| R
+    R --> A["offset advances,<br/>partition unblocked"]
+```
 
-| Exception | Retryable? | Because |
-|---|---|---|
-| `DataAccessException` | yes | the database may come back |
-| `RestClientException` | yes | the downstream service may recover |
-| `IllegalArgumentException` | **no** | the record is invalid and always will be |
-| `NullPointerException` | **no** | that's a bug in your code; retrying hides it |
-
-`addNotRetryableExceptions` matches on assignability, so registering `IllegalArgumentException` also catches `NumberFormatException`, which extends it.
+Note what the recoverer does for you at the end: once it has run, the container treats the record as handled and the offset advances. That is what unblocks the partition, and it is why a recoverer that does nothing is data loss.
 
 ---
 
 ## Hands-on
 
-### 1. Reproduce the poison pill
+### 1. Reproduce the block, and measure it
 
-Start your consumer, then produce garbage:
+Start the consumer and the producer, then produce a poison pill:
 
 ```bash
-echo 'this is not json' | docker exec -i kafka-1 kafka-console-producer \
+echo 'not json' | docker exec -i kafka-1 kafka-console-producer \
   --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-The consumer floods:
-
-```
-ERROR ... Unparseable Wikimedia event [partition=1 offset=8423]: Unrecognized token 'this'
-ERROR ... Unparseable Wikimedia event [partition=1 offset=8423]: Unrecognized token 'this'
-ERROR ... Unparseable Wikimedia event [partition=1 offset=8423]: Unrecognized token 'this'
-```
-
-Same partition, same offset, forever. Confirm the partition is stuck:
+Watch the group while it happens:
 
 ```bash
 docker exec kafka-1 kafka-consumer-groups \
@@ -158,7 +141,7 @@ docker exec kafka-1 kafka-consumer-groups \
   --describe --group wikimedia-consumer-group
 ```
 
-One partition's `CURRENT-OFFSET` is frozen while its `LAG` grows. The other two are fine.
+One partition's `CURRENT-OFFSET` is frozen while its `LAG` climbs. The other two are healthy. That asymmetry is the signature of a poison pill, and it is what to look for when a pipeline is "mostly working".
 
 Stop the consumer.
 
@@ -167,7 +150,7 @@ Stop the consumer.
 Update `KafkaConsumerConfig`:
 
 ```java
-package com.javaguy.consumer.config;
+package com.example.wikimedia.consumer.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -182,14 +165,14 @@ public class KafkaConsumerConfig {
 
     /**
      * Retry schedule, per record:
-     *   attempt 1 — immediate
-     *   attempt 2 — after 1,000 ms
-     *   attempt 3 — after 2,000 ms
-     *   attempt 4 — after 4,000 ms, then give up
+     *   attempt 1, immediate
+     *   attempt 2, after 1,000 ms
+     *   attempt 3, after 2,000 ms
+     *   attempt 4, after 4,000 ms, then give up
      *
      * ExponentialBackOff sums the intervals it hands out. Once that total reaches
-     * maxElapsedTime (1,000 + 2,000 + 4,000 = 7,000), the next call returns STOP.
-     * It is not measuring wall-clock time, so a slow listener does not shorten it.
+     * maxElapsedTime, which is 1,000 + 2,000 + 4,000, the next call returns STOP.
+     * It does not measure wall-clock time, so a slow listener does not shorten it.
      */
     @Bean
     public DefaultErrorHandler errorHandler() {
@@ -199,8 +182,8 @@ public class KafkaConsumerConfig {
 
         var handler = new DefaultErrorHandler(backoff);
 
-        // A malformed record will never parse, no matter how often it is retried.
-        // Skip the backoff entirely rather than block the partition for 7 seconds.
+        // A malformed record will never parse, however often it is retried.
+        // Skip the backoff rather than block the partition for seven seconds.
         handler.addNotRetryableExceptions(IllegalArgumentException.class);
 
         return handler;
@@ -213,184 +196,173 @@ public class KafkaConsumerConfig {
 
         var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
         factory.setConsumerFactory(consumerFactory);
-        factory.setCommonErrorHandler(errorHandler);
         factory.setConcurrency(3);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-        factory.getContainerProperties().setPollTimeout(3_000);
-        factory.getContainerProperties().setObservationEnabled(true);
+        factory.setCommonErrorHandler(errorHandler);
+
         return factory;
     }
 }
 ```
 
-No recoverer yet, so an exhausted record is logged and **skipped**. That's better than an infinite loop and worse than what you want — the record is silently discarded. Lesson 21 fixes that.
+`setCommonErrorHandler` is the line that replaces the default. Omit it and the bean exists, is never consulted, and you spend an hour wondering why your backoff is not applied.
 
-### 3. Watch a non-retryable exception skip the backoff
+### 3. Watch a non-retryable failure skip the backoff
 
-Restart the consumer. The poison record from step 1 is still there, still uncommitted.
+Start the consumer. The poison pill from step 1 is still there.
 
 ```
-ERROR ... Unparseable Wikimedia event [partition=1 offset=8423]: Unrecognized token 'this'
-ERROR ... Backoff none exhausted for wikimedia-stream-1@8423
-INFO  ... Saved | partition=1 offset=8424 ...
+ERROR ... Unparseable Wikimedia event [partition=1 offset=1043]
+WARN  ... Backoff none exhausted for ...
 ```
 
-**One attempt.** No 1-second wait, no 2-second wait. `Backoff none exhausted` is Spring telling you it applied a zero-length backoff because the exception was classified non-retryable. The record is skipped, the offset advances, and the partition unblocks immediately.
+One attempt, no waiting, and then the partition moves on. Confirm it:
 
-The pipeline resumes. Records behind the poison pill flow again.
+```bash
+docker exec kafka-1 kafka-consumer-groups \
+  --bootstrap-server kafka-1:29092 \
+  --describe --group wikimedia-consumer-group
+```
 
-### 4. Watch a retryable exception use the full schedule
+Lag on that partition clears. The record was skipped, which is progress and also the problem: it is gone, and all you have is a log line naming the partition and offset. Lesson 21 gives it somewhere to go.
 
-Now simulate a transient failure. Temporarily make every fifth record throw something *not* on the non-retryable list:
+### 4. Watch a retryable failure use the backoff
+
+Now simulate a transient failure. Add a temporary rule to the listener that throws a retryable exception for one specific title:
 
 ```java
-    if (record.offset() % 5 == 0) {
-        throw new IllegalStateException("simulated transient failure");
-    }
-    repository.save(event);
+        if ("RETRY_ME".equals(event.title())) {
+            throw new IllegalStateException("Simulated transient failure");
+        }
 ```
 
-Restart and watch the timestamps:
+`IllegalStateException` is not registered as non-retryable, so it takes the backoff path. Produce a matching record:
 
-```
-11:42:01.204 ERROR ... simulated transient failure
-11:42:02.213 ERROR ... simulated transient failure
-11:42:04.219 ERROR ... simulated transient failure
-11:42:08.226 ERROR ... simulated transient failure
-11:42:08.230 ERROR ... Backoff FixedBackOff/ExponentialBackOff exhausted for wikimedia-stream-0@8500
+```bash
+echo '{"type":"edit","title":"RETRY_ME","user":"u","bot":false,"wiki":"enwiki","server_name":"en.wikipedia.org","timestamp":1,"comment":"c","namespace":0}' \
+  | docker exec -i kafka-1 kafka-console-producer \
+    --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-Four attempts. The gaps are 1 s, 2 s, 4 s — exactly the schedule from the table. Then the handler gives up and skips.
+Watch the timestamps in the log. Four attempts, roughly 1, 2 and 4 seconds apart, then the record is given up on. Time the whole sequence: about seven seconds, exactly as the table predicted.
 
-Note the elapsed time between the first and last attempt: about 7 seconds, during which **that partition processed nothing else.** Retrying is not free. It is a deliberate trade of latency for the chance that the failure was transient.
+While it is retrying, describe the group again. That partition is frozen for the full seven seconds and the other two keep working.
 
-Remove the simulated failure.
+Remove the temporary rule afterwards.
 
-### 5. See why the classification matters
+### 5. Compare the two paths deliberately
 
-Swap the classification — register `IllegalStateException` as non-retryable and leave `IllegalArgumentException` retryable:
+Produce one of each, a malformed record and a `RETRY_ME` record, and note the difference in the logs.
 
-```java
-handler.addNotRetryableExceptions(IllegalStateException.class);
-```
+The malformed one is handled in milliseconds. The transient one costs seven seconds of that partition's throughput. Both end in the same place, which is the record being skipped.
 
-Produce another malformed record. Now the parse failure gets the full 7-second backoff before being skipped, and the transient failure gets none.
-
-You have exactly inverted the correct behaviour, and nothing in Kafka or Spring will tell you. The record that could never succeed is retried; the record that might succeed on the next attempt is not.
-
-Put it back to `IllegalArgumentException`.
+That is the trade the `addNotRetryableExceptions` line manages. Classify an exception wrongly in one direction and you waste seven seconds per bad record; wrongly in the other and you throw away a record that would have succeeded on the second attempt.
 
 ---
 
 ## Try it yourself
 
-1. Set `backoff.setMaxElapsedTime(15_000L)`. How many attempts now, and what are the intervals? Verify against the log timestamps rather than the table.
+1. Remove `addNotRetryableExceptions` and produce a malformed record. Time how long the partition is blocked, then put the line back. Multiply that by a thousand malformed records and describe what your lag graph looks like.
 
-2. Replace `ExponentialBackOff` with `new ExponentialBackOffWithMaxRetries(3)` and set the multiplier and initial interval to match. Same behaviour? Which version would you rather read in a code review six months from now?
+2. Change `maxElapsedTime` to 15,000 and predict the schedule before running it. How many attempts, and at what intervals? Verify against the log timestamps.
 
-3. Make `repository.save()` throw `DataIntegrityViolationException` (produce the same record twice with a unique constraint). Is that exception retryable by default? Should it be? Note the trap: it's a `DataAccessException`, and the *same* record will fail identically forever.
+3. Make the listener take 20 seconds per attempt and keep `maxElapsedTime` at 7,000. How many attempts do you get, and how long does the whole sequence take in real time? Explain why the setting's name is misleading.
 
-4. With `setConcurrency(3)`, produce a poison pill and measure the throughput drop with the old (infinite retry) handler versus the new one. Why is it exactly one third and not total?
+4. Register `IllegalStateException` as non-retryable as well, then produce the `RETRY_ME` record again. It is now skipped immediately. Argue for and against that classification for a failure that represents a database outage.
 
 ---
 
 ## Common mistakes
 
-**Configuring no error handler at all.**
-You get 9 instant retries, then a skip — but since the offset was never committed, the record is redelivered on the next poll and the loop restarts. Effectively infinite.
+**Defining the error handler bean and not calling `setCommonErrorHandler`.**
+The bean exists, the defaults apply, and nothing you configured takes effect.
 
-**Retrying every exception.**
-A malformed record blocks its partition for the whole backoff window, every single delivery, and is then discarded anyway. You paid the latency for nothing.
+**Retrying a malformed record.**
+The bytes do not change. You block the partition and fail anyway.
 
-**Retrying `NullPointerException`.**
-It's a bug in your code. Retrying it four times just delays the moment you notice.
+**Leaving `DefaultErrorHandler` with no recoverer.**
+An exhausted record is logged and skipped, which is silent data loss with a paper trail nobody reads.
 
-**Assuming `maxElapsedTime` is wall-clock time.**
-It's the sum of the backoff intervals handed out. A listener that takes 30 s per attempt doesn't consume any of the budget.
+**Assuming `maxElapsedTime` measures elapsed time.**
+It sums the intervals it hands out. Slow attempts do not count against it.
 
-**Configuring the error handler and forgetting `factory.setCommonErrorHandler(...)`.**
-The bean exists and is never used. Spring's default handler stays in place, silently.
+**Assuming a poison pill stops the consumer.**
+It stops one partition. With concurrency of 3 you lose a third of throughput and the process looks healthy.
+
+**Classifying exceptions by where they were thrown rather than by whether a retry could help.**
+The only question that matters is whether the same input might succeed next time.
 
 **Using `SeekToCurrentErrorHandler`.**
-Removed in Spring Kafka 3.x.
-
-**Exhausting retries with no recoverer.**
-The record is logged and skipped — permanently lost. That's the state your consumer is in right now.
+Removed in Spring Kafka 3.0.
 
 ---
 
 ## Check your understanding
 
-**1. Your listener throws on record at offset 500. The error handler retries it. Where does the record come from on the second attempt?**
+**1. With no error handler configured, a malformed record arrives. Describe what happens over the next hour.**
 
 <details>
 <summary>Reveal answer</summary>
 
-From the broker, on the next `poll()`.
+The record is retried nine times with no delay, the handler gives up on that delivery, and because the offset was never committed the next poll returns the same record and it all happens again. That loop continues indefinitely.
 
-`DefaultErrorHandler` doesn't hold the record in memory and re-invoke your method. It calls `seek()` on the consumer to reposition it back to offset 500, so the next poll fetches that record again — along with the ones after it — and the container invokes your listener with it.
+The partition makes no progress for the entire hour while its lag grows. The other partitions are unaffected, so throughput drops by roughly a third and nothing crashes.
 
-Two consequences follow. First, retrying is genuinely re-consuming, so the whole partition is rewound and everything after offset 500 is re-fetched. Second, because the offset was never committed, a consumer restart mid-retry begins the retry sequence again from scratch, with a fresh backoff.
+The only signals are per-partition lag and a very large volume of repeated error logs. Aggregate lag on a busy topic may not even look alarming.
 
 </details>
 
-**2. `ExponentialBackOff(1_000L, 2.0)` with `maxElapsedTime(7_000L)`. Your listener takes 30 seconds per attempt. How many attempts, and how long does the whole thing take?**
+**2. Why does registering `IllegalArgumentException` as non-retryable belong in the error handler rather than in the listener?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Still **four attempts** — and about 127 seconds.
+Because the listener's job is to say what went wrong, and the handler's job is to decide what to do about it.
 
-`maxElapsedTime` bounds the sum of the *backoff intervals* the strategy has handed out (0 + 1,000 + 2,000 + 4,000 = 7,000), not the real time spent. Time your listener spends executing is invisible to the backoff.
+The listener already made its contribution in Lesson 16, by translating a Jackson failure into an exception type that means "this input is permanently invalid". That is information the listener has and the handler does not.
 
-So you get: 30 s attempt, 1 s wait, 30 s attempt, 2 s wait, 30 s attempt, 4 s wait, 30 s attempt, then STOP. That's 120 s of processing plus 7 s of waiting.
-
-Which also means you've blocked that partition for over two minutes — and quite possibly tripped `max.poll.interval.ms` (5 min) along the way if the batch had more failing records.
+Putting the policy in the handler keeps it in one place for every listener, and lets you change the retry strategy without touching business code. It also means the classification is visible where the backoff is configured, which is where someone debugging retry behaviour will look.
 
 </details>
 
-**3. Why is retrying a malformed JSON record worse than simply skipping it immediately?**
+**3. `maxElapsedTime` is 7,000 ms and each attempt takes 20 seconds. How many attempts, and over what period?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because the retry cannot possibly succeed, and it costs you the partition for the duration.
+Four attempts, over roughly 87 seconds.
 
-The record's bytes are fixed. `objectMapper.readValue()` is deterministic. Attempt four will fail exactly as attempt one did. Meanwhile the consumer thread is seeking back and re-polling the same offset, so every valid record behind it on that partition is delayed by the full 7-second backoff window.
+The backoff sums the intervals it hands out, which are 1,000, 2,000 and 4,000 milliseconds, reaching 7,000 and then stopping. It has no visibility into how long each attempt itself took.
 
-Worse, this happens on *every delivery*. If the record is never committed or routed away, that's 7 seconds of blockage each time it comes round.
+So the real elapsed time is four attempts at 20 seconds each, plus 7 seconds of waiting, and the partition is blocked for all of it. The setting's name suggests it bounds that duration and it does not, which matters a great deal when your processing is slow.
 
-Skipping immediately is better. Routing it to a dead-letter topic — where you can inspect it and fix the producer — is better still, and that's Lesson 21.
+If you need to bound real time, you have to bound the work: reduce what one attempt does, or use a smaller retry count and let the recoverer handle it sooner.
 
 </details>
 
-**4. You register `IllegalArgumentException` as non-retryable. Your code throws `NumberFormatException`. Is it retried?**
+**4. A recoverer that only logs is described here as data loss. Why, given that the log line contains the partition and offset?**
 
 <details>
 <summary>Reveal answer</summary>
 
-No — it's treated as non-retryable.
+Because after the recoverer runs, the container advances the offset and the record is never delivered again.
 
-`addNotRetryableExceptions` matches on **assignability**, not exact type equality. `NumberFormatException extends IllegalArgumentException`, so it matches the registered type and skips the backoff.
+The log line tells you a record existed and where it was, which is genuinely more than nothing, and it depends entirely on someone reading it before the topic's retention deletes the record. With seven-day retention you have seven days to notice, find the log, extract the partition and offset, and go and fetch the payload by hand.
 
-This is usually what you want, and it's occasionally a surprise: registering a broad exception type silently classifies its entire subtree. Registering `RuntimeException` as non-retryable would make *everything* non-retryable, since almost every exception you throw extends it.
-
-The same assignability rule applies to the retryable side of the classifier.
+At any real volume that does not happen. The record is effectively lost the moment the recoverer returns, which is why Lesson 21 replaces logging with publishing to a topic that keeps the payload, the headers and the failure reason together for thirty days.
 
 </details>
 
-**5. The error handler exhausts its retries and no recoverer is configured. What happens to the record, and what does your monitoring see?**
+**5. Why does the error handler seek backwards rather than keeping the record in memory to retry?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The record is logged at `ERROR` and **skipped**. The offset advances past it, the partition unblocks, and the record is never processed.
+Because the log is already a durable, ordered store of the record, so holding a copy would duplicate state that Kafka is better at holding.
 
-It is not deleted from Kafka — it sits in the topic until retention expires — but nothing in your system will ever look at it again. From your database's perspective, that event simply never happened.
+Seeking back to the offset means the retry reads the record from the broker again, which keeps exactly one source of truth. If the process dies during retries, nothing is lost, because nothing was being held anywhere: the offset is still uncommitted and the next owner of the partition starts from it.
 
-Your monitoring sees: consumer lag returns to zero, no failed health check, no rising error rate beyond a single log line per lost record. Everything looks healthy. You have silent data loss that presents identically to normal operation.
-
-This is precisely why the recoverer exists. A dead-letter topic converts "lost" into "parked somewhere I can find it."
+It also explains why retries block the partition. The consumer has moved its read position backwards, so it must work forwards through that record again before it can reach anything behind it. An in-memory retry queue could have avoided that, at the cost of records that vanish on a crash and an ordering guarantee that no longer holds.
 
 </details>
 
@@ -398,8 +370,12 @@ This is precisely why the recoverer exists. A dead-letter topic converts "lost" 
 
 ## Recap
 
-`DefaultErrorHandler` catches your listener's exception, seeks back, and retries on a `BackOff` schedule. `ExponentialBackOff` with `maxElapsedTime(7_000)` yields four attempts at 1 s, 2 s, 4 s — because it sums the intervals it issues, not wall-clock time. Exceptions you classify as non-retryable skip the backoff entirely, which is why Lesson 16 wrapped `JacksonException` in `IllegalArgumentException` three lessons before this handler existed.
+The container hands a thrown exception to a `CommonErrorHandler`, and the default retries nine times with no delay, forever, because the offset never advances.
 
-Your partition no longer blocks. But an exhausted record is now silently discarded, which is its own kind of data loss.
+`DefaultErrorHandler` with an `ExponentialBackOff` bounds that, and `maxElapsedTime` bounds it by summing the intervals handed out rather than by measuring real time. Four attempts and seven seconds of waiting is the schedule you configured.
 
-**Next:** [Lesson 21 — Dead-letter topics →](21-dead-letter-topics.md)
+Exceptions that cannot succeed on a retry must be registered as non-retryable, and the exception type your listener throws is what makes that possible. Retries seek backwards, so they block one partition and leave the others alone.
+
+What you still do not have is anywhere for a failed record to go. It is skipped, and a log line is all that remains.
+
+**Next:** [Lesson 21: Dead-Letter Topics](21-dead-letter-topics.md)

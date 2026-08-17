@@ -1,517 +1,534 @@
-# Lesson 25 — Schema Registry & Avro
+# Lesson 25: Schema Registry and Avro
 
-> **Part 5 — Production** · 40 minutes
+> **Part 5: Production**
 
 ---
 
 ## What you'll learn
 
-- What a `StringSerializer` actually costs you, and why "it's just JSON" fails at scale
-- How Avro's wire format works — and why a message carries 5 bytes of schema, not the schema
-- How to generate Java classes from an `.avsc` and produce/consume them
-- What BACKWARD, FORWARD, and FULL compatibility mean, and which one you want
+- What a schema registry stores, and what the five bytes at the front of every Avro record mean
+- How to generate Java types from a schema and produce them
+- Why an incompatible schema fails on the first `send()` rather than at startup
+- Why the dead-letter topic must stay untyped when everything else becomes typed
 
 ---
 
 ## Why this matters
 
-Your topic currently holds raw JSON strings. Nothing stops a producer from renaming `server_name` to `serverName` tomorrow. Nothing stops it sending `"bot": "false"` as a string instead of a boolean. Nothing tells you until the consumer throws — in production, on records already durably written, which you now cannot parse.
+Your topic carries JSON strings. Nothing validates them, nothing versions them, and the only reason your consumer survives a Wikimedia field change is the `ignoreUnknown` flag you set in Lesson 16.
 
-The consumer's `@JsonIgnoreProperties(ignoreUnknown = true)` from Lesson 16 protects you against *added* fields. It offers nothing against removed fields, renamed fields, or changed types.
+That works because you own neither end. When you own both, a registry gives you something better: a schema the broker's clients agree on, checked at publish time, so an incompatible change fails in the pipeline that made it rather than in the consumer that received it.
 
-A schema registry makes that class of incident structurally impossible: it **rejects the producer's schema at registration time** if it would break existing consumers. The failure moves from your 3 a.m. pager to the producer team's CI pipeline.
+This is also the lesson with the most moving parts, because a typed value changes the producer, the consumer, both build files, and the dead-letter path.
 
 ---
 
 ## Before you start
 
-[Lesson 24](24-testing-with-testcontainers.md). Schema Registry is already running from Lesson 00:
-
-```bash
-curl -s http://localhost:8085/subjects
-```
-
-`[]` — no schemas registered yet. Note the port: **8085** on your host, mapped to the container's 8081 (which would collide with the producer).
+[Lesson 24](24-testing-with-testcontainers.md), with a passing test suite.
 
 ---
 
 ## The concept
 
-### The problem with JSON on a topic
+### What the registry stores
 
-Three costs, in ascending order of pain.
+Schema Registry is a small HTTP service that stores schemas and assigns each one an integer ID. It stores them in a Kafka topic called `_schemas`, which is the pattern you have now seen three times: consumer offsets, cluster metadata, and now schemas all live in logs.
 
-**Size.** Every record repeats every field name. `{"server_name":"en.wikipedia.org","bot":false,...}` sends the string `"server_name"` with each of the millions of events. Across a 7-day retention that's gigabytes of field names.
+Clients talk to it, not to each other. A producer registers a schema and gets an ID. A consumer sees an ID and asks for the schema.
 
-**No contract.** The topic's schema is "whatever the producer felt like sending." It's documented in a Java record on the consumer side, which the producer team has never read.
+### The five bytes
 
-**Failure is deferred and asymmetric.** A bad change is accepted by Kafka instantly and discovered by the consumer later. By then the records are durable and unparseable. Your only options are to fix the consumer to handle both shapes, or skip records.
-
-### Avro
-
-Avro is a binary serialization format with a schema written in JSON. The schema declares field names and types once, and the data on the wire is just the values — positionally encoded, no field names.
-
-A 1.8 KB Wikimedia JSON event becomes a few hundred bytes.
-
-More importantly the schema is a *contract*, and a machine-checkable one.
-
-### The wire format
-
-This is the part worth understanding precisely, because it explains everything else.
-
-A Confluent Avro message is:
+An Avro record on a Kafka topic is not just Avro. The Confluent serializer writes:
 
 ```
-[magic byte 0x00][4-byte schema ID][avro-encoded payload]
+byte 0        magic byte, always 0x00
+bytes 1 to 4  schema ID, 4-byte big-endian int
+bytes 5 to n  the Avro-encoded payload
 ```
 
-Five bytes of overhead. The **schema itself is not in the message** — only an integer ID.
+This is why a consumer using `StringDeserializer` on an Avro topic gets unreadable text rather than an exception, as Lesson 15 warned. It is also why the payload is compact: field names are in the schema, not in every record, which is the main size win over JSON.
 
 ```mermaid
-sequenceDiagram
-    participant P as Producer
-    participant R as Schema Registry
-    participant K as Kafka
-    participant C as Consumer
-
-    P->>R: register schema for subject wikimedia-stream-value
-    R-->>P: schema id = 1
-    P->>K: [0x00][id=1][binary payload]
-    C->>K: poll
-    K-->>C: [0x00][id=1][binary payload]
-    C->>R: GET /schemas/ids/1  (once, then cached)
-    R-->>C: schema definition
-    C->>C: decode payload with that schema
+flowchart LR
+    P["Producer"] -->|"1. register schema"| SR["Schema Registry<br/>:8085"]
+    SR -->|"2. schema ID 7"| P
+    P -->|"3. 0x00 + id 7 + payload"| K["wikimedia-stream"]
+    K -->|"4. read record"| C["Consumer"]
+    C -->|"5. what is schema 7?"| SR
+    SR -->|"6. schema"| C
 ```
-
-Consequences that follow directly:
-
-- **Producers and consumers both need the registry**, at least once. It's a hard dependency.
-- **The consumer caches by ID**, so the registry isn't on the hot path.
-- **The consumer decodes with the *writer's* schema**, then projects onto its own **reader's** schema. That projection is where compatibility rules live.
 
 ### Subjects and compatibility
 
-The registry stores schemas under a **subject**. The default naming strategy is `<topic>-value` (and `<topic>-key` for keys). So `wikimedia-stream-value`.
+A **subject** is the unit of versioning, named `<topic>-value` by default. Each subject holds an ordered list of schema versions and a compatibility rule.
 
-Each subject has a **compatibility mode** that governs which new versions are allowed:
+The default rule is `BACKWARD`, meaning a new schema must be able to read data written with the previous one. In practice that allows adding a field with a default and removing a field, and forbids adding a required field or changing a type.
 
-| Mode | New schema must be able to… | Safe change | Upgrade first |
-|---|---|---|---|
-| `BACKWARD` (default) | read data written by the **previous** schema | delete a field; add a field **with a default** | consumers |
-| `FORWARD` | be read **by** the previous schema | add a field; delete a field **with a default** | producers |
-| `FULL` | both | add or delete only fields with defaults | either |
-| `NONE` | anything | — | pray |
+`BACKWARD` is the right default because it lets you deploy consumers before producers.
 
-The mental model that actually sticks:
+### Where the failure actually surfaces
 
-> **BACKWARD** means *new code can read old data.* You upgrade **consumers first**, then producers.
->
-> **FORWARD** means *old code can read new data.* You upgrade **producers first**, then consumers.
+This is the detail most material gets wrong, and it matters operationally.
 
-BACKWARD is the default because the common case is reprocessing history: a new consumer must be able to read the whole topic, including records written months ago.
+`KafkaAvroSerializer` registers the schema **lazily, inside `serialize()`**, on the first record it handles. So an incompatible schema does not fail at startup. Your application starts cleanly, reports healthy, and then the first `send()` fails with a `SerializationException` wrapping a `RestClientException` carrying HTTP 409.
 
-**Defaults are what make evolution work.** Adding a field with a default is backward-compatible because a consumer reading an old record — where the field is absent — substitutes the default. Adding a field *without* a default is a breaking change, and the registry will reject it.
+Setting `auto.register.schemas` to false does not add a startup check either. It changes who may register, not when the lookup happens.
 
-### What the registry actually prevents
-
-It doesn't validate data. It validates **schemas**, at registration.
-
-When a producer starts and its schema differs from the latest registered version, the client tries to register the new version. The registry checks it against the subject's compatibility rules and **returns HTTP 409 if it would break consumers.**
-
-The producer fails to start. Nobody's 3 a.m. is ruined. That's the whole product.
+The consequence is worth planning for: a bad schema deploy looks like a healthy rollout followed by a producer that cannot publish anything. If you want a startup check, you have to make one, and the last exercise asks you to.
 
 ---
 
 ## Hands-on
 
-### 1. Add the dependencies
+### 1. Add Schema Registry to the cluster
 
-Confluent's artifacts are not on Maven Central. Both modules need the repository and the serializer:
+Append to `docker-compose.yml`:
 
-```xml
-<repositories>
-    <repository>
-        <id>confluent</id>
-        <url>https://packages.confluent.io/maven/</url>
-    </repository>
-</repositories>
-
-<dependencies>
-    <dependency>
-        <groupId>io.confluent</groupId>
-        <artifactId>kafka-avro-serializer</artifactId>
-        <version>8.0.3</version>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.avro</groupId>
-        <artifactId>avro</artifactId>
-    </dependency>
-</dependencies>
+```yaml
+  schema-registry:
+    image: confluentinc/cp-schema-registry:8.3.1
+    hostname: schema-registry
+    container_name: schema-registry
+    ports:
+      - "8085:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka-1:29092,kafka-2:29092,kafka-3:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # The registry stores schemas in a Kafka topic it creates itself.
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+    networks:
+      - kafka-network
+    depends_on:
+      kafka-1:
+        condition: service_healthy
 ```
 
-Keep `kafka-avro-serializer` aligned with the `cp-schema-registry` image tag from `docker-compose.yml` — both are `8.0.3` here. A mismatch usually works and occasionally produces baffling deserialization errors.
+Note the port mapping. The container listens on 8081, which your producer already owns on the host, so it is published on **8085**. Getting this backwards produces a port conflict that looks like the registry failing to start.
 
-`avro` itself is version-managed by Spring Boot's BOM.
+```bash
+docker compose up -d
+curl -s localhost:8085/subjects
+```
 
-### 2. Define the schema
+An empty array. And the topic it created:
 
-`src/main/resources/avro/wikimedia-event.avsc`:
+```bash
+docker exec kafka-1 kafka-topics --bootstrap-server kafka-1:29092 --list | grep _schemas
+```
+
+Lesson 02 predicted this one: `_schemas` appears when Schema Registry starts, not before.
+
+### 2. Add the dependencies
+
+Confluent's artifacts are not on Maven Central, so both projects need the repository:
+
+```xml
+    <repositories>
+        <repository>
+            <id>confluent</id>
+            <url>https://packages.confluent.io/maven/</url>
+        </repository>
+    </repositories>
+```
+
+And the dependencies, in both projects:
+
+```xml
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>8.3.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>1.12.1</version>
+        </dependency>
+```
+
+Both versions are explicit, and that is not an oversight. **Neither artifact is in Spring Boot's BOM**, so a versionless declaration fails the build with a missing-version error. This is worth knowing generally: the BOM covers a large surface, and assuming it covers everything is how you discover it does not.
+
+Keep `kafka-avro-serializer` aligned with the `cp-schema-registry` image tag. Both are 8.3.1 here.
+
+### 3. The schema
+
+`src/main/resources/avro/wikimedia-event.avsc`, in both projects:
 
 ```json
 {
-  "namespace": "com.javaguy.avro",
+  "namespace": "com.example.wikimedia.avro",
   "type": "record",
   "name": "WikimediaEventAvro",
   "fields": [
-    { "name": "type",       "type": "string" },
-    { "name": "title",      "type": "string" },
-    { "name": "user",       "type": ["null", "string"], "default": null },
-    { "name": "bot",        "type": "boolean", "default": false },
-    { "name": "namespace",  "type": ["null", "int"],    "default": null },
-    { "name": "wiki",       "type": "string" },
-    { "name": "serverName", "type": ["null", "string"], "default": null },
-    { "name": "timestamp",  "type": ["null", "long"],   "default": null },
-    { "name": "comment",    "type": ["null", "string"], "default": null }
+    {"name": "type", "type": "string"},
+    {"name": "title", "type": "string"},
+    {"name": "user", "type": ["null", "string"], "default": null},
+    {"name": "bot", "type": "boolean", "default": false},
+    {"name": "namespace", "type": ["null", "int"], "default": null},
+    {"name": "wiki", "type": ["null", "string"], "default": null},
+    {"name": "serverName", "type": ["null", "string"], "default": null},
+    {"name": "timestamp", "type": ["null", "long"], "default": null},
+    {"name": "comment", "type": ["null", "string"], "default": null}
   ]
 }
 ```
 
-Two conventions that matter:
+Every optional field is a union with `null` **and** carries a default. The default is what makes a later removal backward-compatible, so omitting it is how you paint yourself into a corner three releases from now.
 
-**A nullable field is a union `["null", "T"]` with `"default": null`.** Avro has no implicit nullability. The order matters — `null` first, because the default must match the *first* branch of the union.
+### 4. Generate the Java class
 
-**Every optional field has a default.** This is what makes future schema evolution possible. A field without a default can never be added later under BACKWARD compatibility, and can never be removed under FORWARD.
-
-`type`, `title`, and `wiki` are required, on purpose. A Wikimedia event without them is meaningless, and making them nullable "just in case" pushes the null check into every consumer forever.
-
-### 3. Generate the Java class
+Add the plugin to both projects, with an explicit version for the same reason as above:
 
 ```xml
-<plugin>
-    <groupId>org.apache.avro</groupId>
-    <artifactId>avro-maven-plugin</artifactId>
-    <executions>
-        <execution>
-            <phase>generate-sources</phase>
-            <goals><goal>schema</goal></goals>
-            <configuration>
-                <sourceDirectory>${project.basedir}/src/main/resources/avro</sourceDirectory>
-                <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
-                <stringType>String</stringType>
-            </configuration>
-        </execution>
-    </executions>
-</plugin>
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <version>1.12.1</version>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/src/main/resources/avro</sourceDirectory>
+                            <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
 ```
 
 ```bash
 ./mvnw generate-sources
 ```
 
-`target/generated-sources/avro/com/javaguy/avro/WikimediaEventAvro.java` now exists — a `SpecificRecord` with a builder.
+`WikimediaEventAvro` now exists under `target/generated-sources/avro`, with a builder. It is generated code, so it does not go in version control.
 
-`<stringType>String</stringType>` matters. Without it, Avro generates `CharSequence` fields (backed by `Utf8`), and `event.getTitle().equals("Nikola Tesla")` returns `false` in a way that will cost you an afternoon.
+### 5. Producer: serialize Avro
 
-> The generated class is build output. Don't commit it, don't edit it. The `.avsc` is the source of truth.
-
-### 4. Configure the producer
+In the producer's `application.yml`, change the value serializer and point at the registry:
 
 ```yaml
-spring:
-  kafka:
-    producer:
-      bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
-      acks: all
+
       properties:
-        enable.idempotence: true
         schema.registry.url: http://localhost:8085
-        # Fail at startup if the schema is incompatible, rather than at first send.
+        # Registering from the producer is convenient locally. In a pipeline with
+        # a CI schema check you would set this false and register there instead.
         auto.register.schemas: true
 ```
 
-And the producer's type parameter changes:
+The template type changes, so `WikimediaProducer` becomes:
 
 ```java
-private final KafkaTemplate<String, WikimediaEventAvro> kafkaTemplate;
+@Service
+public class WikimediaProducer {
 
-public void sendMessage(WikimediaEventAvro event) {
-    kafkaTemplate.send(TOPIC, event.getWiki(), event)
-            .whenComplete((result, ex) -> { /* as Lesson 13 */ });
+    private static final Logger log = LoggerFactory.getLogger(WikimediaProducer.class);
+    private static final String TOPIC = "wikimedia-stream";
+
+    private final KafkaTemplate<String, WikimediaEventAvro> kafkaTemplate;
+
+    public WikimediaProducer(KafkaTemplate<String, WikimediaEventAvro> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public void sendMessage(String key, WikimediaEventAvro event) {
+        kafkaTemplate.send(TOPIC, key, event)
+                .whenComplete((result, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to send key={}: {}", key, ex.getMessage());
+                        return;
+                    }
+                    var metadata = result.getRecordMetadata();
+                    log.debug("Sent topic={} partition={} offset={}",
+                            metadata.topic(), metadata.partition(), metadata.offset());
+                });
+    }
 }
 ```
 
-Note the key is now `event.getWiki()` — Lesson 11's keying decision, finally expressible because the producer now has a parsed object rather than an opaque string.
+### 6. Producer: map JSON to Avro
 
-> **`auto.register.schemas: true` is a development setting.** In production it's `false`, and schemas are registered by a CI step or by the Schema Registry Maven plugin, so a rogue producer cannot introduce a schema nobody reviewed.
+This is the step the pipeline actually needs and the one most Avro tutorials skip. The SSE feed gives you JSON, and the producer now has to build a typed object from it.
 
-### 5. Configure the consumer
+In `WikimediaStreamPublisher`, replace `publish` and `partitionKey` with:
+
+```java
+    private void publish(String json) {
+        JsonNode node;
+        try {
+            node = objectMapper.readTree(json);
+        } catch (Exception e) {
+            log.warn("Skipping unparseable SSE event: {}", e.getMessage());
+            return;
+        }
+
+        String title = text(node, "title");
+        if (title == null) {
+            log.warn("Skipping SSE event with no title");
+            return;
+        }
+
+        producer.sendMessage(title, toAvro(node, title));
+    }
+
+    private WikimediaEventAvro toAvro(JsonNode node, String title) {
+        return WikimediaEventAvro.newBuilder()
+                .setType(text(node, "type") == null ? "unknown" : text(node, "type"))
+                .setTitle(title)
+                .setUser(text(node, "user"))
+                .setBot(node.path("bot").asBoolean(false))
+                .setNamespace(node.hasNonNull("namespace") ? node.get("namespace").asInt() : null)
+                .setWiki(text(node, "wiki"))
+                .setServerName(text(node, "server_name"))
+                .setTimestamp(node.hasNonNull("timestamp") ? node.get("timestamp").asLong() : null)
+                .setComment(text(node, "comment"))
+                .build();
+    }
+
+    private String text(JsonNode node, String field) {
+        return node.hasNonNull(field) ? node.get(field).asText() : null;
+    }
+```
+
+Notice the shape change. Parsing moved from the consumer to the producer, so a malformed SSE event is now dropped at the edge rather than published and dead-lettered later.
+
+That is a real improvement and a real trade. The pipeline can no longer carry a record it cannot understand, which means Lesson 16's poison pill scenario mostly disappears, and it also means you have lost the audit trail of the malformed input. Whether that is progress depends on whether you would ever have investigated it.
+
+### 7. Consumer: deserialize Avro
 
 ```yaml
-spring:
-  kafka:
-    consumer:
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+
       properties:
         schema.registry.url: http://localhost:8085
-        # Deserialize into the generated class rather than a generic GenericRecord.
+        # Without this you get a GenericRecord instead of WikimediaEventAvro.
         specific.avro.reader: true
 ```
 
+`specific.avro.reader` is the line people forget. Omit it and every record arrives as a `GenericRecord`, your cast fails, and the error message says nothing about this property.
+
+The listener now receives a typed value, and Lesson 16's `parse` method is gone entirely:
+
 ```java
-@KafkaListener(topics = "wikimedia-stream", groupId = "wikimedia-consumer-group")
-public void consume(ConsumerRecord<String, WikimediaEventAvro> record, Acknowledgment ack) {
-    WikimediaEventAvro event = record.value();
-    // no parse(), no ObjectMapper, no JacksonException
-    ...
-}
+    @KafkaListener(topics = "wikimedia-stream", groupId = "wikimedia-consumer-group")
+    public void consume(ConsumerRecord<String, WikimediaEventAvro> record,
+                        Acknowledgment acknowledgment) {
+
+        WikimediaEventAvro event = record.value();
+
+        try {
+            repository.save(toEntity(event, record));
+        } catch (DataIntegrityViolationException e) {
+            log.debug("Already stored partition={} offset={}",
+                    record.partition(), record.offset());
+        }
+
+        acknowledgment.acknowledge();
+    }
 ```
 
-**The `parse()` method is gone**, and with it the `IllegalArgumentException` wrapping from Lesson 16.
+`toEntity` needs its accessors updated to Avro's getters, and any `CharSequence` from Avro converted with `toString()` before it reaches a `String` field.
 
-Think about what that means for Lesson 20's error handler. A malformed payload can no longer reach your listener — it fails inside `KafkaAvroDeserializer`, during `poll()`, before the container invokes you. It throws `SerializationException`, which your `DefaultErrorHandler` cannot route to the DLT, because the failure happened before there was a record to route.
+### 8. The dead-letter path must stay untyped
 
-That's what `ErrorHandlingDeserializer` is for. Wrap the real deserializer:
+Here is the problem the type change creates, and it will stop your application from starting.
 
-```yaml
-      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
-      properties:
-        spring.deserializer.value.delegate.class: io.confluent.kafka.serializers.KafkaAvroDeserializer
+`DeadLetterPublishingRecoverer` needs a `KafkaTemplate`. Your container's records are now `WikimediaEventAvro`, but a record that failed may have failed *because* it could not be deserialised, in which case there is no Avro object to republish, only bytes.
+
+So the dead-letter template must be a byte-array template, declared separately:
+
+```java
+    @Bean
+    public KafkaTemplate<byte[], byte[]> dltKafkaTemplate(
+            ProducerFactory<?, ?> producerFactory) {
+
+        Map<String, Object> config = new HashMap<>(producerFactory.getConfigurationProperties());
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class);
+        config.remove("schema.registry.url");
+
+        return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(config));
+    }
+
+    @Bean
+    public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(
+            KafkaTemplate<byte[], byte[]> dltKafkaTemplate) {
+
+        return new DeadLetterPublishingRecoverer(dltKafkaTemplate,
+                (record, exception) ->
+                        new TopicPartition(record.topic() + ".dlt", record.partition()));
+    }
 ```
 
-Now a deserialization failure yields a `null` value plus a header carrying the exception, the error handler sees a real record, and the DLT still works. Without this, moving to Avro silently disables the dead-letter path you built in Part 4.
+Two things follow, and both are the right outcome.
 
-### 6. Watch the schema register
+The dead-letter topic now holds **raw bytes including the five-byte Avro envelope**, which is exactly what you want: byte-identical to what failed, replayable, and inspectable with the registry's help. Your Lesson 22 dead-letter consumer needs its value type changed to `byte[]`, and its payload logging becomes a hex or length summary rather than a string.
 
-Start the producer and send one event. Then:
+And a record that failed to deserialise can still be parked, which a typed template could not have done.
+
+### 9. Run the migration
+
+Delete the topic so you are not mixing JSON and Avro records:
 
 ```bash
-curl -s http://localhost:8085/subjects | jq
+docker exec kafka-1 kafka-topics --bootstrap-server kafka-1:29092 \
+  --delete --topic wikimedia-stream
 ```
 
-```json
-["wikimedia-stream-value"]
-```
+Start the consumer, then the producer, and trigger the stream. Then check what got registered:
 
 ```bash
-curl -s http://localhost:8085/subjects/wikimedia-stream-value/versions | jq
-curl -s http://localhost:8085/subjects/wikimedia-stream-value/versions/1 | jq '.schema | fromjson'
+curl -s localhost:8085/subjects
+curl -s localhost:8085/subjects/wikimedia-stream-value/versions
+curl -s localhost:8085/subjects/wikimedia-stream-value/versions/1 | head -c 400
 ```
 
-The schema you wrote, stored under version 1, subject `wikimedia-stream-value`.
-
-### 7. See the five-byte header
+And confirm the wire format directly:
 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream --max-messages 1
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream --max-messages 1
 ```
 
-Binary garbage. The `StringDeserializer` the console consumer uses has no idea what this is. That's the point — the bytes are meaningless without the schema.
+Unreadable, with a visible leading null byte. That is the magic byte and schema ID, and it is exactly the failure Lesson 15 predicted for a mismatched deserializer.
 
-Read it properly, resolving the schema ID against the registry:
+### 10. Break compatibility on purpose
 
-```bash
-docker exec schema-registry kafka-avro-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --property schema.registry.url=http://localhost:8081 \
-  --topic wikimedia-stream --max-messages 1
-```
-
-(Inside that container the registry is on its own port 8081, not the host's 8085.)
-
-Your event, decoded.
-
-### 8. Break compatibility on purpose
-
-Check the mode:
-
-```bash
-curl -s http://localhost:8085/config | jq
-```
+Add a required field with no default to the schema:
 
 ```json
-{"compatibilityLevel": "BACKWARD"}
+    {"name": "mandatoryThing", "type": "string"}
 ```
 
-Now add a **required** field to the `.avsc` — no default:
-
-```json
-{ "name": "revisionId", "type": "long" }
-```
-
-Regenerate and restart the producer.
+Regenerate, restart the producer, and watch what happens. The application **starts cleanly**. Then the first record fails:
 
 ```
-Schema being registered is incompatible with an earlier schema for subject
-"wikimedia-stream-value"; error code: 409
+SerializationException: Error registering Avro schema
+Caused by: RestClientException: Schema being registered is incompatible with an earlier schema; error code: 409
 ```
 
-**The producer refuses to start.** Under BACKWARD, a consumer using the *new* schema must be able to read data written with the *old* one. Old records have no `revisionId` and the field has no default, so there is nothing to substitute. The registry rejects it.
+Note where that appeared: on the first `send()`, not at startup, because the serializer registers lazily. Your health endpoint was green the whole time.
 
-Now give it a default:
-
-```json
-{ "name": "revisionId", "type": "long", "default": 0 }
-```
-
-Restart. It registers as version 2, and old records read back with `revisionId = 0`.
-
-```bash
-curl -s http://localhost:8085/subjects/wikimedia-stream-value/versions | jq
-```
-
-```json
-[1, 2]
-```
-
-That 409 is the entire value proposition. The incident was prevented at the producer's startup, not discovered on the consumer's pager.
-
-### 9. Test compatibility before you deploy
-
-You don't need a running producer to check a schema:
-
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
-  --data '{"schema": "{\"type\":\"record\",\"name\":\"WikimediaEventAvro\",\"namespace\":\"com.javaguy.avro\",\"fields\":[{\"name\":\"type\",\"type\":\"string\"}]}"}' \
-  http://localhost:8085/compatibility/subjects/wikimedia-stream-value/versions/latest | jq
-```
-
-```json
-{"is_compatible": false}
-```
-
-Put that in CI. A pull request that changes an `.avsc` gets a compatibility check before a human reviews it.
+Remove the field and regenerate.
 
 ---
 
 ## Try it yourself
 
-1. Set the subject to `FORWARD` (`PUT /config/wikimedia-stream-value` with `{"compatibility":"FORWARD"}`). Now *delete* a field without a default. Does it register? Now try under `BACKWARD`. Explain both results in terms of who reads whose data.
+1. Add an optional field with a default, regenerate, and restart the producer. Check `versions` on the subject. Why was that accepted when step 10 was rejected? State the rule in terms of what the old schema can read.
 
-2. Remove `<stringType>String</stringType>` and regenerate. Write `assertThat(event.getTitle()).isEqualTo("Nikola Tesla")`. Watch it fail. What type is `getTitle()` returning, and why does `equals` return false?
+2. Set `auto.register.schemas: false` and remove the subject with `curl -X DELETE localhost:8085/subjects/wikimedia-stream-value`. Start the producer. Where does it fail, and what does that tell you about who should own registration in a real deployment?
 
-3. Produce with Avro, then consume with `StringDeserializer`. What do you get? Now do the reverse. Which failure is louder, and which would you rather have in production?
+3. Read a dead-letter record's bytes and decode them by hand: strip the first byte, read the next four as a big-endian int, fetch that schema from the registry. This is Lesson 22's header decoding applied to a payload.
 
-4. Move to Avro *without* `ErrorHandlingDeserializer`, then produce a corrupt record (`echo 'garbage' | kafka-console-producer`). Where does the exception surface, does it reach the DLT, and can the consumer make progress?
-
-5. Set compatibility to `NONE` and rename a field. Everything registers cleanly. When and how do you find out?
+4. Build the startup check this lesson says does not exist: a bean that posts the local schema to `/compatibility/subjects/wikimedia-stream-value/versions/latest` and fails the context if the registry says it is incompatible. Where in the lifecycle does it belong, and why is that better than discovering it on the first send?
 
 ---
 
 ## Common mistakes
 
-**Adding a field without a default under BACKWARD.**
-Rejected with a 409. That's the system working. Add the default.
+**Declaring `avro` or `kafka-avro-serializer` without a version.**
+Neither is in Spring Boot's BOM, and the build fails with a missing version.
 
-**Forgetting `<stringType>String</stringType>`.**
-Fields become `CharSequence` (`Utf8`), and `.equals(String)` silently returns `false`.
+**Publishing Schema Registry on 8081.**
+Your producer owns that port on the host. Use 8085 and map to 8081 inside.
 
 **Omitting `specific.avro.reader: true`.**
-You get `GenericRecord` and a `ClassCastException` when you assign it to your generated type.
+Every record arrives as a `GenericRecord` and the error says nothing about the cause.
 
-**Moving to Avro and losing the DLT.**
-Deserialization now fails inside `poll()`, before your listener runs. `DefaultErrorHandler` can't route what it never received. Use `ErrorHandlingDeserializer`.
+**Omitting defaults on optional Avro fields.**
+A union with `null` makes the field nullable. The default is what makes removing it compatible later.
 
-**`auto.register.schemas: true` in production.**
-Any producer can register any compatible schema without review. Register from CI instead.
+**Expecting an incompatible schema to fail at startup.**
+Registration is lazy. It fails on the first `send()`, after a green rollout.
 
-**Mismatching `kafka-avro-serializer` and Schema Registry versions.**
-Usually fine, occasionally produces deserialization errors that make no sense.
+**Using a typed `KafkaTemplate` for the dead-letter path.**
+A record that failed to deserialise has no typed form. The dead-letter template must handle bytes.
 
-**Treating Schema Registry as optional infrastructure.**
-Producers and consumers both hard-depend on it. If it's down and a consumer restarts with a cold cache, it cannot decode anything.
-
-**Committing generated Avro classes.**
-The `.avsc` is the source of truth. Generated code drifts.
+**Mixing JSON and Avro records on one topic.**
+The consumer cannot tell which is which. Delete the topic during the migration.
 
 ---
 
 ## Check your understanding
 
-**1. A Kafka message with Avro carries a 4-byte schema ID rather than the schema. Name two things that would be worse if it carried the full schema.**
+**1. A consumer reads an Avro topic with `StringDeserializer`. What happens?**
 
 <details>
 <summary>Reveal answer</summary>
 
-**Size.** The Wikimedia schema is roughly a kilobyte of JSON. Attaching it to every event would make the schema larger than most payloads, and over a 7-day retention it would dwarf the data — you'd be back to the JSON problem, worse.
+It succeeds and produces nonsense, which is the worst of the available outcomes.
 
-**No identity.** With an ID, a consumer can cache the schema after one fetch, and — crucially — the registry knows the *exact* schema version each record was written with. That's what lets it resolve the writer's schema against the reader's schema and apply defaults for missing fields. A self-describing message tells you what it contains; it doesn't tell you which registered version it is, so compatibility checking has nothing to check against.
+`StringDeserializer` calls `new String(bytes, UTF_8)` on whatever it is given. Avro bytes are mostly valid UTF-8 sequences, so decoding does not throw. You get a string containing the magic byte, the schema ID and the binary payload rendered as unprintable characters.
 
-A third: the registry could not reject a bad schema at *registration*, because there'd be no registration step. Failure would move back to the consumer.
+This is the same class of failure as decoding a numeric header as a string in Lesson 22: a type mismatch that produces a plausible-looking wrong answer instead of an error.
 
 </details>
 
-**2. BACKWARD compatibility. You want to add a field. What must be true, and who upgrades first?**
+**2. Why is the schema ID in the record rather than the schema itself?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The field must have a **default**, and you upgrade **consumers first**.
+Size, and it is the main reason Avro beats JSON on the wire.
 
-BACKWARD means "the new schema can read data written with the old schema." Old records simply don't contain the new field. Reading them with the new schema, Avro substitutes the field's default — so a default is mandatory. Without one, there is nothing to put there and the registry returns 409.
+JSON repeats every field name in every record. Avro puts the field names in the schema, stored once in the registry, and each record carries a four-byte reference to it plus the values. On a payload with a dozen fields and short values, the field names were most of the bytes.
 
-Consumers first, because a consumer on the new schema can read both old and new records. If you upgraded the producer first, it would emit records containing a field that the old consumers' schema doesn't know about — which BACKWARD makes no promises about.
+It also means a schema change is one registry write rather than a change to every record, and a consumer can decode a record written under a schema it has never seen by asking for it.
 
-The mnemonic: BACKWARD = *new code reads old data* = roll out the new code (consumers) ahead of the new data (producers).
+The cost is a hard dependency: a consumer that cannot reach the registry cannot decode anything, so the registry becomes infrastructure you have to keep up.
 
 </details>
 
-**3. You migrate to Avro. A producer with a bug emits a corrupt record. Your `DefaultErrorHandler` with the DLT recoverer is unchanged. Where does the record end up?**
+**3. `BACKWARD` compatibility is the default. Which deployment order does it enable?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Nowhere good. It does **not** reach the dead-letter topic, and the consumer stops making progress.
+Consumers first, then producers.
 
-`KafkaAvroDeserializer` runs inside the Kafka client, during `poll()`, before Spring's listener container has a `ConsumerRecord` to hand anyone. The corrupt bytes throw `SerializationException` out of `poll()` itself. Your listener is never invoked, so `DefaultErrorHandler` — which handles exceptions thrown *by the listener* — never sees it. The recoverer never runs.
+`BACKWARD` means the new schema can read data written with the old one. So a consumer upgraded to the new schema still handles every record already on the topic, and every record still being produced by the not-yet-upgraded producers.
 
-The consumer retries the poll, hits the same record, throws again. The partition is blocked exactly as it was in Lesson 16, before you had an error handler at all.
+Deploy the producer first and you would be writing records that old consumers cannot read, which is what `FORWARD` compatibility permits and why it implies the opposite rollout order.
 
-The fix is `ErrorHandlingDeserializer` wrapping the Avro deserializer. It catches the failure, hands the container a record with a `null` value and the exception in a header, and the error handler routes it to the DLT normally.
-
-Migrating to Avro silently disables Part 4 unless you do this.
+Adding a field with a default satisfies `BACKWARD` because an old record simply lacks it and the default fills in. Adding a required field does not, because there is nothing to read for it.
 
 </details>
 
-**4. Schema Registry validates schemas, not data. So what stops a producer sending `"bot": "yes"` when the schema says `boolean`?**
+**4. Your producer starts healthy and cannot publish. What is the most likely cause, and why was startup no help?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The **serializer**, on the producer side, before anything reaches Kafka.
+A schema incompatibility, surfacing as a 409 wrapped in a `SerializationException` on the first `send()`.
 
-`KafkaAvroSerializer` encodes your object against the registered schema. A `boolean` field is written as a single byte. There is no code path that lets a `String` become that byte — the generated `WikimediaEventAvro` class has a `boolean` field, so `"yes"` doesn't compile.
+Startup was no help because `KafkaAvroSerializer` registers the schema lazily, inside `serialize()`. Nothing contacts the registry until the first record needs encoding, so context startup, health checks and readiness probes all pass on an application that cannot do its job.
 
-That's the real mechanism: Avro moves the type check from *runtime data validation* to *compile-time typing plus binary encoding*. The schema constrains the generated class; the class constrains your code.
+Setting `auto.register.schemas` to false does not change the timing, only who is permitted to register.
 
-Contrast JSON, where `{"bot": "yes"}` serialises fine, is accepted by the broker, is durably stored, and explodes on the consumer three days later.
-
-So the registry validates schema *evolution*, the generated class validates *your code*, and the binary format leaves no room for the data to disagree with the schema.
+If you want this caught at deploy time you have to check it yourself, either in CI against the registry's compatibility endpoint or in a startup bean, which is the fourth exercise.
 
 </details>
 
-**5. Compatibility is set to `NONE` and a producer renames `title` to `pageTitle`. Trace what a consumer experiences.**
+**5. Why must the dead-letter template be a byte-array template once values are Avro?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Registration succeeds — `NONE` checks nothing. The producer starts happily and begins writing records under schema version 2.
+Because the records most likely to fail are the ones with no valid typed form.
 
-The consumer fetches schema 2 by ID and decodes the payload with it (the writer's schema), then projects onto its own reader's schema, which still expects `title`. Avro resolves fields **by name**. There is no `title` in the writer's schema, and `title` has no default in the reader's schema.
+A deserialization failure means the bytes could not become a `WikimediaEventAvro`, so a template typed to that class has nothing it could publish. The record would be unrecoverable at exactly the moment you most want it parked.
 
-So deserialization throws `AvroTypeException` — for every record written after the rename. Meanwhile `pageTitle` is silently ignored, because the reader doesn't know it.
+A byte-array template republishes the original bytes untouched, including the magic byte and schema ID. That keeps Lesson 22's replay property intact and lets you decode the payload later by fetching the referenced schema from the registry.
 
-The consumer fails on record after record. The records are durable and unreadable. The rename looks harmless in a diff, and there is no test that would have caught it.
-
-Under `BACKWARD`, the registry would have returned 409 and the producer would not have started. This is precisely the incident class the registry exists to eliminate, and `NONE` opts out of it.
-
-(A rename is a delete plus an add. To do it safely you add `pageTitle` with a default, migrate consumers, then remove `title` — two compatible steps rather than one incompatible one.)
+It also changes your dead-letter consumer's value type to `byte[]`, which is the honest consequence: the dead-letter topic is now the one place in the pipeline that is deliberately untyped, because it exists to hold things that did not fit their type.
 
 </details>
 
@@ -519,10 +536,10 @@ Under `BACKWARD`, the registry would have returned 409 and the producer would no
 
 ## Recap
 
-Avro puts a machine-checkable contract on the topic. The wire format carries a magic byte, a 4-byte schema ID, and the encoded values — never the field names, never the schema. The registry stores schemas per subject and rejects, with a 409 at producer startup, any version that would break existing consumers under the subject's compatibility mode. BACKWARD (the default) means new code reads old data: upgrade consumers first, and give every optional field a default.
+Schema Registry stores schemas in a Kafka topic and hands out integer IDs, and every Avro record on your topic begins with a magic byte and a four-byte reference to one. Field names live in the schema rather than in each record, which is the size win and the reason the registry becomes required infrastructure.
 
-Two traps worth remembering: `<stringType>String</stringType>`, or `equals` lies to you; and `ErrorHandlingDeserializer`, or your dead-letter topic quietly stops working.
+Subjects are versioned with a compatibility rule, `BACKWARD` by default, which lets you deploy consumers ahead of producers. Registration is lazy, so an incompatible schema fails on the first `send()` after a green startup.
 
-The pipeline is durable, resilient, tested, and typed. You still can't see what it's doing.
+Both Avro dependencies need explicit versions because Boot's BOM does not manage them, and the dead-letter path must stay on bytes so that a record which failed to deserialise can still be parked.
 
-**Next:** [Lesson 26 — Observability →](26-observability.md)
+**Next:** [Lesson 26: Observability](26-observability.md)

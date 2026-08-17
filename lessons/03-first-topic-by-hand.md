@@ -168,7 +168,7 @@ Partition:0	Offset:3	live message
 
 There is Lesson 01's model made concrete: one partition, offsets counting up from 0, in the order you wrote them.
 
-> Older tutorials pass these as `--property print.partition=true`. That still works in Kafka 4.2 but prints a deprecation warning, because the flag was split by role: `--formatter-property` for the consumer's output formatter, `--reader-property` for the console producer's input reader, and `--producer-property` or `--consumer-property` for actual client configuration. If you see `Option --property is deprecated`, that is why.
+> Older tutorials pass these as `--property print.partition=true`. That still works in Kafka 4.x but prints a deprecation warning, because the flag was split by role: `--formatter-property` for the consumer's output formatter, `--reader-property` for the console producer's input reader, and `--command-property` for the underlying client's own configuration. If you see `Option --property is deprecated`, that is why. The older `--producer-property` is deprecated in the same release, also in favour of `--command-property`.
 
 ### 6. Ask how many records exist
 

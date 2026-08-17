@@ -1,39 +1,39 @@
-# Lesson 14 — Real Data: The Wikimedia SSE Stream
+# Lesson 14: Real Data, the Wikimedia SSE Stream
 
-> **Part 2 — The Producer** · 30 minutes
+> **Part 2: The Producer**
 
 ---
 
 ## What you'll learn
 
-- What Server-Sent Events are, and why they're a natural fit for Kafka
+- What Server-Sent Events are, and why they suit Kafka
 - How to consume an SSE stream with `WebClient` and `Flux`
 - Why decoding to `ServerSentEvent<String>` beats parsing the raw body yourself
-- Why an unbounded reactive stream feeding a bounded producer buffer is a backpressure problem
+- Why an unbounded reactive stream feeding a bounded producer buffer is a real problem, and how to bound it
 
 ---
 
 ## Why this matters
 
-Your producer works, but it sends `"edit-1"` at startup. Time to point it at something real: **every edit made to every Wikimedia project, worldwide, as it happens.**
+Your producer works, but it sends `edit-1` at startup. Time to point it at something real: every edit made to every Wikimedia project, worldwide, as it happens.
 
-Wikimedia publishes this at `https://stream.wikimedia.org/v2/stream/recentchange` as a public, unauthenticated Server-Sent Events feed. It emits somewhere between tens and hundreds of events per second, forever. It is an ideal Kafka source: a firehose you don't control, that you want to buffer, replay, and fan out to many consumers.
+Wikimedia publishes this at `https://stream.wikimedia.org/v2/stream/recentchange` as a public, unauthenticated Server-Sent Events feed. It emits somewhere between tens and hundreds of events per second, indefinitely. That makes it an ideal Kafka source: a firehose you do not control, which you want to buffer, replay and fan out to many consumers.
 
-This is also the lesson where every setting from Lessons 10–13 stops being theoretical. Real volume, real batches, real compression.
+It is also the lesson where every setting from Lessons 10 to 13 stops being theoretical. Real volume, real batches, real compression, and a real reason to care what happens when the buffer fills.
 
 ---
 
 ## Before you start
 
-[Lesson 13](13-send-callbacks-and-errors.md). Working internet connection.
+[Lesson 13](13-send-callbacks-and-errors.md), and a working internet connection.
 
-Watch the raw feed before you write any code — always look at the data first:
+Look at the data before writing any code:
 
 ```bash
 curl -N https://stream.wikimedia.org/v2/stream/recentchange | head -20
 ```
 
-Ctrl-C when you've seen enough.
+Press Ctrl-C when you have seen enough.
 
 ---
 
@@ -41,7 +41,7 @@ Ctrl-C when you've seen enough.
 
 ### Server-Sent Events
 
-SSE is a one-directional streaming protocol over ordinary HTTP. The server holds the response open and pushes text frames. Each frame looks like:
+SSE is a one-directional streaming protocol over ordinary HTTP. The server holds the response open and pushes text frames:
 
 ```
 event: message
@@ -50,82 +50,94 @@ data: {"$schema":"/mediawiki/recentchange/1.0.0","meta":{...},"type":"edit","tit
 
 ```
 
-Fields are `event:`, `id:`, `data:`, `retry:`. A blank line terminates the frame. The payload you want is the JSON after `data:`.
+The fields are `event:`, `id:`, `data:` and `retry:`, and a blank line ends the frame. The payload you want is the JSON after `data:`.
 
-Compared to WebSockets, SSE is server-to-client only, runs over plain HTTP, and reconnects automatically. For a public event feed it's exactly right.
+Compared with WebSockets, SSE is server to client only, runs over plain HTTP, and reconnects automatically. For a public event feed that is exactly right.
 
-> Look at that `id:` field. Wikimedia's own feed is backed by Kafka, and the SSE `id` is a Kafka topic/partition/offset. You are consuming someone else's Kafka topic over HTTP, and about to put it into yours.
+> Look at that `id:` field. Wikimedia's feed is itself backed by Kafka, and the SSE id carries a topic, partition and offset. You are consuming someone else's Kafka topic over HTTP, and about to put it into your own.
 
-### Why not just read the body?
+### Why not read the body yourself
 
-You could stream the raw response and split on newlines yourself. Don't. You'd have to handle:
+You could stream the raw response and split on newlines, but you would have to handle multi-line `data:` fields, comment lines beginning with a colon that are used as keep-alives, blank-line frame boundaries, and `retry:` directives with reconnection.
 
-- multi-line `data:` fields (concatenated with `\n`)
-- comment lines beginning with `:` (used as keep-alives)
-- blank-line frame boundaries
-- `retry:` directives and reconnection
-
-Spring's `WebClient` already decodes all of this. Ask for `ServerSentEvent<String>` and you get parsed frames, with `.data()` giving you the payload and nothing else.
+`WebClient` decodes all of that. Ask for `ServerSentEvent<String>` and you get parsed frames, with `data()` giving you the payload:
 
 ```java
 .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
 ```
 
-The `ParameterizedTypeReference` exists because of generic type erasure — `ServerSentEvent<String>.class` isn't expressible in Java, so this anonymous subclass carries the type at runtime. It's the same trick as Jackson's `TypeReference`.
+The `ParameterizedTypeReference` exists because of generic type erasure. `ServerSentEvent<String>.class` is not expressible in Java, so this anonymous subclass carries the type at runtime. It is the same trick as Jackson's `TypeReference`.
 
-If you instead call `.bodyToFlux(String.class)`, WebClient still decodes SSE frames and hands you the `data:` payloads — but you lose access to `event`, `id`, and `retry`. Decoding to `ServerSentEvent<String>` keeps them.
+Calling `.bodyToFlux(String.class)` also works and still decodes frames, but you lose access to `event`, `id` and `retry`.
 
 ### `Flux` and the shape of the pipeline
 
-`bodyToFlux` returns a `Flux<ServerSentEvent<String>>` — a reactive stream of zero-to-infinite elements. Nothing happens until you **subscribe**; a `Flux` is a recipe, not a running process.
+`bodyToFlux` returns a `Flux<ServerSentEvent<String>>`, a reactive stream of zero to infinite elements. Nothing happens until you subscribe: a `Flux` is a recipe rather than a running process.
 
-```java
-webClient.get()
-        .uri("/stream/recentchange")
-        .retrieve()
-        .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
-        .filter(event -> event.data() != null && !event.data().isBlank())
-        .subscribe(
-                event -> producer.sendMessage(event.data()),
-                error -> log.error("SSE stream error: {}", error.getMessage())
-        );
-```
+`subscribe()` returns immediately and the stream runs on a Reactor Netty event-loop thread.
 
-`subscribe()` returns immediately and the stream runs on a Reactor Netty event-loop thread. The `filter` guards against keep-alive frames, which arrive with a null or empty `data`.
+### The backpressure problem, and why you must fix it
 
-### The backpressure problem hiding in plain sight
-
-This is the important part, and most tutorials skip it.
+This is the part most tutorials skip, and it is the reason this lesson is not simply four lines of `WebClient`.
 
 `subscribe(consumer)` with a plain lambda requests an **unbounded** number of elements. Reactor will push events at you as fast as Wikimedia sends them.
 
-Meanwhile `producer.sendMessage()` appends to a bounded 32 MiB buffer (Lesson 12). If Kafka slows down and the buffer fills, `send()` **blocks** for `max.block.ms`.
+Meanwhile `producer.sendMessage()` appends to a bounded 32 MiB buffer, as you configured in Lesson 12. If Kafka slows down and that buffer fills, `send()` blocks for up to `max.block.ms`, which you measured in Lesson 12's second exercise.
 
-That block happens on a Netty event-loop thread — a thread shared with other network I/O, which you must never block. In a small demo the event rate is modest and Kafka is local, so it never bites. Under a real load spike, or a broker failover, it would.
+That block would happen on a Netty event-loop thread, which is shared with other network activity and must never be blocked. With a local cluster and a modest event rate it never bites. During a broker failover, or an ISR dropping below the floor so that `acks=all` writes are refused, it would.
 
-The correct answers are `onBackpressureBuffer` with a bounded queue and an explicit overflow strategy, or `limitRate()` to bound the demand, or publishing onto a dedicated scheduler with `publishOn(Schedulers.boundedElastic())`. The version below keeps the project's original shape so it matches the reference implementation; the exercise asks you to fix it.
+There are three ways to bound this, and you will use two:
+
+| Approach | Effect |
+|---|---|
+| `limitRate(n)` | requests at most `n` elements at a time instead of unbounded demand |
+| `publishOn(Schedulers.boundedElastic())` | moves the work off the event loop, so blocking harms only that scheduler |
+| `onBackpressureBuffer(size, strategy)` | bounded queue with an explicit policy for overflow |
+
+`limitRate` plus `publishOn` is the smallest change that makes the pipeline honest. It does not make blocking impossible; it makes blocking survivable, and moves it somewhere it cannot take down unrelated network activity.
+
+```mermaid
+flowchart LR
+    SSE["Wikimedia SSE<br/>stream.wikimedia.org"]
+    F["Flux&lt;ServerSentEvent&gt;<br/>filter keep-alives"]
+    S["publishOn<br/>boundedElastic"]
+    P["WikimediaProducer<br/>keyed by page title"]
+    K["wikimedia-stream<br/>3 partitions"]
+
+    SSE -->|"HTTP, held open"| F
+    F -->|"limitRate(256)"| S
+    S --> P
+    P -->|"acks=all, snappy"| K
+```
 
 ---
 
 ## Hands-on
 
-### 1. Add WebFlux
+### 1. Add WebFlux and Jackson
 
-`WebClient` lives in WebFlux. Add it to `pom.xml`:
+`WebClient` lives in WebFlux, and you need Jackson to pull the key out of each event:
 
 ```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-webflux</artifactId>
-</dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jackson</artifactId>
+        </dependency>
 ```
 
-This also starts a Netty web server, which is what will serve the controller in step 4.
+WebFlux also starts a Netty web server, which will serve the controller in step 4. You already have a web server from actuator in Lesson 12; adding WebFlux makes it a reactive one.
+
+Declaring `spring-boot-starter-jackson` explicitly is deliberate. Boot 4 splits Jackson into its own starter, and while the web starters pull it in transitively for their codecs, this application is about to depend on `ObjectMapper` directly. Depending on something explicitly when you use it directly is worth the extra four lines.
 
 ### 2. `config/WebClientConfig.java`
 
 ```java
-package com.javaguy.producer.config;
+package com.example.wikimedia.producer.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -141,58 +153,110 @@ public class WebClientConfig {
 }
 ```
 
-Exposing the *builder* rather than a finished `WebClient` lets each consumer configure its own base URL, while still picking up Boot's auto-configured codecs and observability instrumentation.
+Exposing the builder rather than a finished `WebClient` lets each caller set its own base URL while still picking up Boot's auto-configured codecs and observability instrumentation. That instrumentation matters in Lesson 26.
 
-### 3. `stream/WikimediaStreamConsumer.java`
+### 3. `stream/WikimediaStreamPublisher.java`
 
-The name is unfortunate but it's the project's: this class *consumes* the SSE stream and *produces* to Kafka. It has nothing to do with a Kafka consumer.
+This class consumes the SSE stream and publishes to Kafka, which is why it is named a publisher rather than a consumer. Naming it after the Kafka side avoids a class called a consumer that has nothing to do with a Kafka consumer.
 
 ```java
-package com.javaguy.producer.stream;
+package com.example.wikimedia.producer.stream;
 
-import com.javaguy.producer.producer.WikimediaProducer;
+import com.example.wikimedia.producer.kafka.WikimediaProducer;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.scheduler.Schedulers;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 @Service
-public class WikimediaStreamConsumer {
+public class WikimediaStreamPublisher {
 
-    private static final Logger log = LoggerFactory.getLogger(WikimediaStreamConsumer.class);
+    private static final Logger log = LoggerFactory.getLogger(WikimediaStreamPublisher.class);
 
     private final WebClient webClient;
     private final WikimediaProducer producer;
+    private final ObjectMapper objectMapper;
+    private final AtomicBoolean running = new AtomicBoolean(false);
 
-    public WikimediaStreamConsumer(WebClient.Builder webClientBuilder, WikimediaProducer producer) {
+    public WikimediaStreamPublisher(WebClient.Builder webClientBuilder,
+                                    WikimediaProducer producer,
+                                    ObjectMapper objectMapper) {
         this.webClient = webClientBuilder.baseUrl("https://stream.wikimedia.org/v2").build();
         this.producer = producer;
+        this.objectMapper = objectMapper;
     }
 
-    public void consumeStreamAndPublish() {
-        // Decode SSE framing so only the JSON payload reaches Kafka —
-        // no "data:" prefixes, no keep-alive comments.
+    public boolean startPublishing() {
+        if (!running.compareAndSet(false, true)) {
+            return false;
+        }
+
         webClient.get()
                 .uri("/stream/recentchange")
                 .retrieve()
                 .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
                 .filter(event -> event.data() != null && !event.data().isBlank())
+                // Bound demand instead of asking for an unbounded number of events.
+                .limitRate(256)
+                // Move off the Netty event loop, because sendMessage can block
+                // when the producer's buffer is full.
+                .publishOn(Schedulers.boundedElastic())
                 .subscribe(
-                        event -> producer.sendMessage(event.data()),
-                        error -> log.error("SSE stream error: {}", error.getMessage())
-                );
+                        event -> publish(event.data()),
+                        error -> {
+                            log.error("SSE stream failed: {}", error.getMessage());
+                            running.set(false);
+                        },
+                        () -> {
+                            log.warn("SSE stream completed unexpectedly");
+                            running.set(false);
+                        });
+
+        return true;
+    }
+
+    private void publish(String json) {
+        producer.sendMessage(partitionKey(json), json);
+    }
+
+    // The page title keeps every edit to one page on one partition, which is the
+    // ordering guarantee from Lesson 11. Keying by meta.domain would have been the
+    // hot-partition mistake: en.wikipedia.org alone dominates this feed.
+    private String partitionKey(String json) {
+        try {
+            JsonNode node = objectMapper.readTree(json);
+            String title = node.path("title").asText(null);
+            return title == null || title.isBlank() ? null : title;
+        } catch (Exception e) {
+            log.warn("Could not read title, sending unkeyed: {}", e.getMessage());
+            return null;
+        }
     }
 }
 ```
 
+Four things in there are decisions rather than syntax.
+
+**The `AtomicBoolean` guard.** Without it, calling the endpoint twice creates two independent subscriptions to the same stream, and every event is published to Kafka twice. This is the kind of bug that looks like Kafka duplicating records, which it is not.
+
+**`limitRate(256)` and `publishOn`.** The two lines from the concept section, and the only reason this pipeline is safe to leave running.
+
+**A `null` key is a deliberate fallback,** not an error. A record with no key goes through the built-in partitioner from Lesson 04, which is the correct degradation: you would rather publish an unordered event than drop it.
+
+**`tools.jackson`, not `com.fasterxml.jackson`.** Jackson 3 changed its package root. Lesson 16 covers what else moved.
+
 ### 4. `controller/WikimediaController.java`
 
 ```java
-package com.javaguy.producer.controller;
+package com.example.wikimedia.producer.controller;
 
-import com.javaguy.producer.stream.WikimediaStreamConsumer;
+import com.example.wikimedia.producer.stream.WikimediaStreamPublisher;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -202,56 +266,35 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v1/wikimedia")
 public class WikimediaController {
 
-    private final WikimediaStreamConsumer wikimediaStreamConsumer;
+    private final WikimediaStreamPublisher publisher;
 
-    public WikimediaController(WikimediaStreamConsumer wikimediaStreamConsumer) {
-        this.wikimediaStreamConsumer = wikimediaStreamConsumer;
+    public WikimediaController(WikimediaStreamPublisher publisher) {
+        this.publisher = publisher;
     }
 
     @GetMapping
     public ResponseEntity<String> startPublishing() {
-        wikimediaStreamConsumer.consumeStreamAndPublish();
+        if (!publisher.startPublishing()) {
+            return ResponseEntity.status(409).body("Stream already running");
+        }
         return ResponseEntity.accepted().body("Streaming started");
     }
 }
 ```
 
-`202 Accepted` is the honest status code: you've started a long-running background process, not completed a request. Returning `ResponseEntity` with an explicit status beats a `void` method that silently 200s.
+`202 Accepted` is the honest status code: you have started a long-running background process, not completed a request. `409 Conflict` for a second call is the visible half of the guard in step 3.
 
-### 5. Update the producer for raw JSON
+### 5. Delete the startup sender
 
-The SSE payload is a JSON document. For now, send it unkeyed — matching the reference implementation, and matching the discussion in Lesson 11 about this project not needing per-record ordering.
+`StartupMessageSender` has served its purpose. Delete the file. Events now come from the stream, triggered by an HTTP call, and `WikimediaProducer` keeps the keyed signature from Lesson 11 unchanged.
 
-Simplify `sendMessage` back to a single argument:
-
-```java
-    public void sendMessage(String message) {
-        kafkaTemplate.send(TOPIC, message)
-                .whenComplete((result, ex) -> {
-                    if (ex != null) {
-                        log.error("Failed to send message: {}", ex.getMessage());
-                        return;
-                    }
-                    var metadata = result.getRecordMetadata();
-                    log.debug("Sent → topic={} partition={} offset={}",
-                            metadata.topic(), metadata.partition(), metadata.offset());
-                });
-    }
-```
-
-### 6. Delete the startup sender
-
-`StartupMessageSender` has served its purpose. Delete the file. Real events now come from the stream, triggered by an HTTP call.
-
-### 7. Run it
+### 6. Run it
 
 ```bash
 ./mvnw spring-boot:run
 ```
 
-The app starts on port 8081 and does nothing. The stream is not running yet — `consumeStreamAndPublish()` hasn't been called.
-
-Trigger it:
+The application starts on port 8081 and publishes nothing, because `startPublishing()` has not been called. Trigger it:
 
 ```bash
 curl http://localhost:8081/api/v1/wikimedia
@@ -261,6 +304,8 @@ curl http://localhost:8081/api/v1/wikimedia
 Streaming started
 ```
 
+Call it again and you get `Stream already running` with a 409.
+
 Watch the topic fill:
 
 ```bash
@@ -268,166 +313,152 @@ docker exec kafka-1 kafka-get-offsets \
   --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-Run it twice, a few seconds apart. The end offsets climb. That's live Wikipedia.
-
-Look at a record:
+Run it twice a few seconds apart and the end offsets climb. Then look at the records:
 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream --max-messages 1
+  --topic wikimedia-stream --max-messages 3 \
+  --formatter-property print.key=true \
+  --formatter-property print.partition=true \
+  --formatter-property key.separator=' | '
 ```
 
-A fat JSON document with `type`, `title`, `user`, `bot`, `wiki`, `server_name`, `timestamp`, `comment`, and much more. In Lesson 16 you'll map exactly the fields you need and ignore the rest.
+You should see page titles as keys, spread across all three partitions, with a JSON document as each value.
 
-### 8. Now check your batching
+### 7. Now the settings from Lessons 10 to 13 mean something
 
-With real volume, the metrics from Lesson 12 finally mean something:
+With real volume flowing, read the metrics you exposed in Lesson 12:
 
 ```bash
 curl -s localhost:8081/actuator/metrics/kafka.producer.batch.size.avg
 curl -s localhost:8081/actuator/metrics/kafka.producer.compression.rate.avg
+curl -s localhost:8081/actuator/metrics/kafka.producer.record.send.rate
 ```
 
-*(Add `spring-boot-starter-actuator` and expose `metrics` if you haven't.)*
+Compare these with the numbers from Lesson 12's thousand-record loop. Batches are now filling because records genuinely arrive continuously, so `linger.ms` rarely expires and compression finally has something to work with.
 
-`compression.rate.avg` should now be well below 1.0 — these JSON documents share enormous structure, and `snappy` over a 32 KiB batch of them is very effective. With the startup sender's six records, this metric was meaningless. With hundreds per second, `linger.ms=20` fills real batches.
-
-Everything you configured in Lesson 12 was invisible until now.
+This is the difference between a tuning exercise and a tuned system: the same configuration, measured under load it was designed for.
 
 ---
 
 ## Try it yourself
 
-1. Call `GET /api/v1/wikimedia` **twice**. Look at the produce rate. What did you just do, and what would a third call do? What's the fix — and why is a `@GetMapping` that mutates server state the wrong verb anyway?
+1. Remove `limitRate(256)` and `publishOn(...)`, then stop two brokers so `acks=all` writes are refused. Watch what happens to the application. Where does it block, and which unrelated functionality stops working? Put both lines back.
 
-2. Fix the backpressure hole. Insert `.limitRate(256)` before `.subscribe(...)`, or `.onBackpressureBuffer(10_000)` with an overflow strategy. Then stop all three brokers while the stream runs and observe what happens to the Netty event loop with and without your fix.
+2. Replace the key with `meta.domain` instead of `title`, run for a minute, and compare per-partition offsets. Quantify the skew, then explain which ordering guarantee each choice gives you and why one is a hot partition.
 
-3. Key the records by page title. You don't have parsed JSON yet, but `ServerSentEvent` gives you `.id()` — Wikimedia's own Kafka offset. Is that a good key? (Think cardinality and ordering: what would it group?)
+3. The stream stops if the connection drops, because the error callback sets `running` back to false and nothing restarts it. Add `.retryWhen(Retry.backoff(...))` before `subscribe`, then work out what happens to events that occurred during the gap. Can you recover them?
 
-4. The `subscribe(...)` error handler logs and the stream **terminates**. Wikimedia will drop a long-lived connection eventually. Add `.retryWhen(Retry.backoff(...))` and confirm the stream recovers.
+4. Compare `--formatter-property print.key=true` output against `kafka-get-offsets` per partition after ten minutes. Are the partitions evenly loaded? Given the key you chose, would you expect them to be?
 
 ---
 
 ## Common mistakes
 
-**Calling `bodyToFlux(String.class)` and then string-splitting on `data:`.**
-WebClient already decodes SSE. Decode to `ServerSentEvent<String>` and read `.data()`.
+**Subscribing with an unbounded lambda and calling it done.**
+The stream will request as fast as the source sends, and the first slow Kafka write blocks a Netty event-loop thread.
 
-**Forgetting that a `Flux` does nothing until subscribed.**
-No `subscribe()`, no stream. Building the pipeline in a `@PostConstruct` and never subscribing is a silent no-op.
+**Blocking work on the event loop.**
+`publishOn(Schedulers.boundedElastic())` exists precisely so that a blocking `send()` harms one scheduler instead of all network activity.
 
-**Calling the trigger endpoint more than once.**
-Each call opens another SSE connection and another subscription, publishing every event twice, three times, `n` times. Nothing prevents it.
+**Allowing the endpoint to start the stream twice.**
+Two subscriptions publish every event twice, and it looks exactly like Kafka duplicating records.
 
-**Blocking a Netty event-loop thread.**
-`producer.sendMessage()` blocks once the record accumulator fills. On an event loop, that stalls unrelated I/O. Use `publishOn(Schedulers.boundedElastic())` or bound demand.
+**Parsing SSE framing by hand.**
+Multi-line data fields, comment keep-alives and reconnect directives are all handled for you.
 
-**Letting the stream die silently.**
-The error consumer in `subscribe()` is terminal — it logs, and the `Flux` is finished. Without `retryWhen`, one network blip ends your ingestion until someone re-calls the endpoint.
+**Forgetting that a `Flux` is inert.**
+No subscribe, no stream. A `Flux` you built and never subscribed to does nothing at all, silently.
 
-**Using `@GetMapping` to start a background job.**
-`GET` should be safe and idempotent. Crawlers, browser prefetch, and monitoring probes will all hit it.
+**Using `com.fasterxml.jackson` imports.**
+Jackson 3 moved to `tools.jackson`. The annotations did not move, which Lesson 16 explains.
+
+**Assuming a null key is a failure.**
+It is the correct fallback. Publishing an unordered record beats dropping it.
 
 ---
 
 ## Check your understanding
 
-**1. You call `GET /api/v1/wikimedia` three times. What happens to your topic?**
+**1. `subscribe()` returns immediately and the stream runs for hours. Which thread is doing that work, and why does it matter?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Every event is produced three times.
+Without `publishOn`, a Reactor Netty event-loop thread, which is shared with other network activity in the application.
 
-Each call runs `consumeStreamAndPublish()` again, which opens a **new** HTTP connection to Wikimedia and creates a **new** subscription. Three independent `Flux` pipelines now push the same events into `sendMessage()`.
+It matters because `producer.sendMessage()` can block. When the record accumulator fills, `send()` waits for up to `max.block.ms`, and if that wait happens on an event-loop thread then every other connection served by that loop stalls with it, including your actuator endpoints and the HTTP request that started the stream.
 
-Nothing deduplicates them. Idempotence (Lesson 10) does not help: these are three genuinely distinct `send()` calls with three different sequence numbers, not internal retries of one. Kafka stores all three faithfully.
-
-Guarding against this needs an `AtomicBoolean` (or a `Disposable` you check and cancel), and the endpoint should be a `POST` — starting a background stream is neither safe nor idempotent.
+`publishOn(Schedulers.boundedElastic())` moves the per-event work to a scheduler designed for blocking calls, which contains the damage.
 
 </details>
 
-**2. Why does `bodyToFlux` need `new ParameterizedTypeReference<ServerSentEvent<String>>() {}` rather than `ServerSentEvent.class`?**
+**2. Why key by page title rather than by wiki domain?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Java erases generics at runtime, so there is no `Class` object representing `ServerSentEvent<String>` — only `ServerSentEvent`. Passing the raw class would leave WebClient unable to know how to decode the `data:` payload.
+Because the ordering requirement is per page, and the domain would concentrate traffic.
 
-`ParameterizedTypeReference` is an anonymous subclass whose *supertype* carries the full generic signature. Because a class's generic superclass **is** retained in the bytecode, WebClient can reflect on it and recover `ServerSentEvent<String>` at runtime.
+Two edits to the same page must be applied in order, so the page is the smallest key that satisfies the requirement. Titles have very high cardinality and no single title dominates, so the hash spreads them across partitions reasonably.
 
-That's why it's always written with trailing `{}` — the braces create the subclass. Without them it wouldn't compile. Jackson's `TypeReference` uses the identical trick.
+The domain would satisfy the same ordering requirement more strongly than needed, and English Wikipedia alone accounts for a large share of this feed. That is the hot partition from Lesson 11, produced by a real key on real data.
 
 </details>
 
-**3. `compression.rate.avg` was ~0.98 in Lesson 12 and is now ~0.25, with no configuration change. What changed?**
+**3. The stream is running and you stop two of three brokers. What happens, with the pipeline as written?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The event rate.
+The ISR falls below the topic's floor of 2, so the broker refuses every `acks=all` write with `NotEnoughReplicasException`.
 
-Compression works on batches. Previously the producer sent six records at startup, so `linger.ms=20` expired with a single record in each batch, and compressing one 200-byte document achieves nothing.
+Your callback from Lesson 13 logs each failure. The records are dropped after the delivery deadline, and events keep arriving from Wikimedia the whole time, so the accumulator fills. Once it is full, `send()` blocks for `max.block.ms` on a bounded-elastic thread, which slows consumption of the stream without taking down the web server.
 
-Now hundreds of records per second arrive. Batches fill toward `batch.size` (32 KiB) before the linger timer expires, and each batch holds many Wikimedia JSON documents that share nearly identical field names and structure. Snappy exploits that repetition heavily.
-
-The lesson: compression ratio is a function of your *throughput and batching*, not just your codec. You can't evaluate `compression.type` on a test that sends ten records.
+That is the intended behaviour of a bounded pipeline. The events are still lost, because nothing persists them, which is exactly the decision Lesson 13's final exercise asked you to make.
 
 </details>
 
-**4. `subscribe()` returns immediately, on the calling HTTP thread. On which thread does `producer.sendMessage()` run, and why is that a problem?**
+**4. Calling the endpoint twice used to publish everything twice. Why is that not a Kafka problem?**
 
 <details>
 <summary>Reveal answer</summary>
 
-On a Reactor Netty **event-loop thread** — one of a small, fixed pool (typically one per CPU core) that handles all non-blocking network I/O for the application.
+Because two subscriptions are two independent streams, and each one calls `send()` for every event it receives. Those are distinct records with distinct sequence numbers, so idempotence has nothing to deduplicate.
 
-`sendMessage()` calls `kafkaTemplate.send()`, which is non-blocking *only while the record accumulator has room*. If Kafka slows — a leader election, a broker failover, `min.insync.replicas` unsatisfied — the 32 MiB buffer fills and `send()` blocks for up to `max.block.ms` (60 s).
-
-Blocking an event-loop thread stalls every other connection that loop is multiplexing, including the SSE stream itself and any HTTP requests your service is serving. A Kafka slowdown becomes a total application stall.
-
-The fix is to move the blocking work off the loop (`publishOn(Schedulers.boundedElastic())`), bound the demand (`limitRate`), or bound the buffer explicitly (`onBackpressureBuffer` with a drop or error strategy).
+This is the concrete version of Lesson 10's warning that idempotence does not deduplicate your application logic. Kafka faithfully stored what you asked it to store, twice, and the bug is entirely in the calling code.
 
 </details>
 
-**5. The SSE `id:` field contains Wikimedia's own Kafka topic, partition, and offset. What does that tell you, and why would it make a poor partition key for your topic?**
+**5. Lesson 12 showed compression achieving almost nothing. Why does it work now, with no configuration change?**
 
 <details>
 <summary>Reveal answer</summary>
 
-It tells you Wikimedia's `recentchange` feed *is* a Kafka topic, exposed over HTTP. You're building a bridge from someone else's Kafka to your own, and the `id` is the resume token you'd use to reconnect without gaps.
+Because compression operates on batches, and the batches are finally full.
 
-As a partition key it would be terrible: the offset increments on every single event, so the key is unique per record. That gives perfect distribution and **zero** ordering benefit — every record is its own group of one. You'd pay to hash a value that groups nothing, and fragment your batches into the bargain.
+In Lesson 12 you produced a burst from a single thread and then stopped, so under light load `linger.ms` expired with only a few records accumulated. Now events arrive continuously at tens to hundreds per second, so a partition's batch reaches `batch.size` before the linger timer expires.
 
-A good key groups records that must stay ordered relative to each other. The page `title` does that. A monotonically increasing offset does the opposite of that.
+The payloads help too. These are JSON documents sharing a schema, field names and vocabulary, which is close to the ideal case for a dictionary-based codec. Identical settings, different load, and an order-of-magnitude different result.
 
 </details>
-
----
-
-## Recap
-
-You pointed the producer at a live firehose. `WebClient` decodes SSE framing into `ServerSentEvent<String>`, a `Flux` streams the frames, and each `data:` payload becomes a Kafka record. Real volume finally made `linger.ms`, `batch.size`, and `compression.type` do visible work.
-
-You also inherited two real weaknesses from the reference implementation: the endpoint can be triggered repeatedly, and the reactive stream pushes unboundedly into a bounded, blocking producer buffer on an event-loop thread. Both are in the exercises, and both are the kind of thing that only fails in production.
 
 ---
 
 ## End of Part 2
 
-Your producer is complete. It:
+Your producer is real. It:
 
-- uses `spring-boot-starter-kafka`, so `KafkaTemplate` actually exists
-- declares its topic in code with the durability settings from Lesson 06
-- writes with `acks=all` and idempotence, so a lost acknowledgment can't duplicate a record
-- can key records to control partition affinity, and you know what that costs
-- batches, lingers, and compresses — and you've seen the metrics prove it
-- reports every failure through a callback rather than pretending success
-- streams live Wikimedia edits
+- streams live events from a public SSE feed with `WebClient` and `Flux`
+- keys each record by page so that edits to one page stay ordered
+- publishes with `acks=all` and idempotence, against a topic that demands two in-sync replicas
+- batches and compresses under genuine load, and can prove it from its own metrics
+- reports the partition and offset the broker assigned, and logs failures rather than discarding them
+- bounds its own demand instead of pushing an unbounded stream into a bounded buffer
 
-The finished producer lives at [`producer/`](../producer) in the repository root, if you want to diff your work against it.
+What it still does not do is survive its own failures. Records dropped after the delivery deadline are gone, and there is no consumer reading any of this.
 
-Nothing is reading any of it. Time to build the other side.
+Time to build the other half.
 
-**Next:** [Lesson 15 — Your first `@KafkaListener` →](15-first-kafkalistener.md)
+**Next:** [Lesson 15: Your First KafkaListener](15-first-kafkalistener.md)

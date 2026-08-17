@@ -60,7 +60,7 @@ It worked, and it cost three things:
 
 ### The new answer is KRaft
 
-KRaft, from Kafka Raft, is Kafka running the Raft consensus protocol itself. It arrived with KIP-500, became production-ready in 3.3, and as of **Kafka 4.0 ZooKeeper support is removed entirely**. Your cluster runs Kafka 4.2, so there was never a choice to make: this is the only mode that exists.
+KRaft, from Kafka Raft, is Kafka running the Raft consensus protocol itself. It arrived with KIP-500, became production-ready in 3.3, and as of **Kafka 4.0 ZooKeeper support is removed entirely**. Your cluster runs Kafka 4.x, so there was never a choice to make: this is the only mode that exists.
 
 The insight is the one from Lesson 02. Kafka already knows how to maintain a replicated, ordered, durable log, and cluster metadata is a log of changes. So store it in one.
 

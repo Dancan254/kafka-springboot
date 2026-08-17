@@ -1,35 +1,29 @@
-# Lesson 21 — Dead-Letter Topics
+# Lesson 21: Dead-Letter Topics
 
-> **Part 4 — Resilience** · 30 minutes
+> **Part 4: Resilience**
 
 ---
 
 ## What you'll learn
 
-- Why a dead-letter topic is the only alternative to blocking or losing records
-- How `DeadLetterPublishingRecoverer` works, and how to control its destination
-- Why the DLT should be routed to the *same partition number* as the source
-- Why the DLT's retention should outlive the topic it shadows
+- What a recoverer is, and how `DeadLetterPublishingRecoverer` uses one
+- Why the failed record goes to the same partition number it came from
+- Which diagnostic headers you get, and which exception actually ends up in them
+- Why a dead-letter topic gets longer retention than the topic it shadows
 
 ---
 
 ## Why this matters
 
-Lesson 20 left you with a bad trade. A record that exhausts its retries is logged and skipped — the partition unblocks, and the record is gone. Not deleted from Kafka, but never processed and never looked at again. Your lag returns to zero and your dashboards stay green while events silently vanish.
+Lesson 20 bounded your retries, and then threw the record away. A log line naming a partition and offset is not a recovery plan: by the time anyone reads it, the record may already have aged out of the topic.
 
-The three options for an unprocessable record are:
-
-1. **Retry forever** — blocks the partition. Everything behind it stops.
-2. **Skip it** — silent data loss. Nobody finds out.
-3. **Park it somewhere** — the partition unblocks, and the record is preserved for a human.
-
-Option 3 is a **dead-letter topic**. It is not a Kafka feature; it's an ordinary topic, and a convention.
+A dead-letter topic turns a lost record into a parked one. The payload, the reason it failed and its exact origin are stored together, in Kafka, with retention you choose, and you can read them with the same tools you already use.
 
 ---
 
 ## Before you start
 
-[Lesson 20](20-error-handler-and-retries.md). An error handler with exponential backoff and non-retryable exceptions.
+[Lesson 20](20-error-handler-and-retries.md), with an error handler using exponential backoff and non-retryable exceptions.
 
 ---
 
@@ -37,52 +31,48 @@ Option 3 is a **dead-letter topic**. It is not a Kafka feature; it's an ordinary
 
 ### The recoverer
 
-`DefaultErrorHandler` takes an optional second collaborator: a recoverer, invoked exactly once, when the backoff returns `STOP`.
+`DefaultErrorHandler` takes an optional first collaborator, a recoverer, invoked exactly once when the backoff stops:
 
 ```java
 new DefaultErrorHandler(recoverer, backOff);
 ```
 
-It's a `BiConsumer<ConsumerRecord<?, ?>, Exception>` — the record that failed, and why. What you do with it is up to you: write it to a table, call an alerting API, or publish it to another Kafka topic.
+It is a `BiConsumer<ConsumerRecord<?, ?>, Exception>`: the record that failed, and why. What you do with it is up to you. Write it to a table, call an alerting API, or publish it to another topic.
 
-`DeadLetterPublishingRecoverer` does the last of these. It needs a `KafkaTemplate`, because publishing to Kafka means producing.
+`DeadLetterPublishingRecoverer` does the last of those, and it needs a `KafkaTemplate`, because publishing to Kafka means producing.
 
-```java
-new DeadLetterPublishingRecoverer(kafkaTemplate);
-```
-
-By default it publishes to a topic named `<original-topic>.DLT` — note the capitals — on a partition chosen by the producer's partitioner.
+By default it publishes to a topic named after the original with `.DLT` appended, note the capitals, on a partition chosen by the producer's partitioner.
 
 ### Controlling the destination
 
-The second constructor argument is a function from `(record, exception)` to a `TopicPartition`:
+The second constructor argument is a function from the record and exception to a `TopicPartition`:
 
 ```java
 new DeadLetterPublishingRecoverer(kafkaTemplate,
         (record, ex) -> new TopicPartition(record.topic() + ".dlt", record.partition()));
 ```
 
-Two decisions encoded there.
+Two decisions are encoded there.
 
-**Lowercase `.dlt`.** Cosmetic, but be consistent — `wikimedia-stream.DLT` and `wikimedia-stream.dlt` are different topics, and auto-creation will happily make both.
+**Lowercase `.dlt`.** Cosmetic, but be consistent, because `wikimedia-stream.DLT` and `wikimedia-stream.dlt` are different topics and auto-creation would happily make both. You turned auto-creation off in Lesson 09, which converts that particular mistake into an error instead of a mystery.
 
-**`record.partition()`.** The failed record goes to *the same partition number* on the DLT that it occupied on the source topic. This is the interesting one.
+**`record.partition()`.** The failed record goes to the same partition number on the dead-letter topic that it occupied on the source. This is the interesting one.
 
 ### Why same-partition routing
 
-Records that shared a partition on the source topic shared it because they shared a key (Lesson 04), which means they had a relative order that mattered.
+Records that shared a partition on the source shared it because they shared a key, which means they had a relative order that mattered.
 
-If three records for the same key fail in sequence and land on three different DLT partitions, you have destroyed their order. Replaying them later — in whatever order three partitions happen to be read — could apply an update before the create it depends on.
+If three records for one key fail in sequence and land on three different dead-letter partitions, their order is gone. Replaying them later, in whatever order three partitions happen to be read, could apply an update before the creation it depends on.
 
-Routing to the same partition number preserves per-partition ordering on the DLT side. Replay partition 1 of the DLT and you get the failures from partition 1 of the source, in the order they failed.
+Routing to the same partition number preserves per-partition ordering on the dead-letter side. Read partition 1 of the dead-letter topic and you get the failures from partition 1 of the source, in the order they failed.
 
-This requires the DLT to have **at least as many partitions as the source**. If the source has 3 and the DLT has 1, publishing to partition 2 fails. That's why `WikimediaTopicConfig` declares both with `.partitions(3)`.
+This requires the dead-letter topic to have at least as many partitions as the source. Publish to partition 2 of a single-partition topic and it fails, which is why both are declared with three.
 
-> A subtlety: this preserves the order in which records *failed*, which is the source order only if failures are processed in order. With `setConcurrency(3)` each partition is single-threaded, so within a partition it holds.
+> A subtlety worth stating: this preserves the order in which records *failed*, which equals source order only if failures are processed in order. With concurrency of 3 each partition is single-threaded, so within a partition it holds.
 
-### The headers you get for free
+### The headers you get, and the one that surprises people
 
-`DeadLetterPublishingRecoverer` attaches diagnostic headers to every record it publishes. The record's key and value are unchanged — the original bytes, preserved exactly.
+`DeadLetterPublishingRecoverer` attaches diagnostic headers to every record it publishes. The key and value are unchanged, byte for byte.
 
 | Header | Type | Content |
 |---|---|---|
@@ -90,54 +80,45 @@ This requires the DLT to have **at least as many partitions as the source**. If 
 | `kafka_dlt-original-partition` | 4-byte big-endian int | source partition |
 | `kafka_dlt-original-offset` | 8-byte big-endian long | source offset |
 | `kafka_dlt-original-timestamp` | 8-byte big-endian long | source timestamp |
-| `kafka_dlt-exception-fqcn` | UTF-8 string | exception class name |
-| `kafka_dlt-exception-message` | UTF-8 string | exception message |
-| `kafka_dlt-exception-cause-fqcn` | UTF-8 string | root cause class, if any |
+| `kafka_dlt-exception-fqcn` | UTF-8 string | the exception the container caught |
+| `kafka_dlt-exception-message` | UTF-8 string | its message |
+| `kafka_dlt-exception-cause-fqcn` | UTF-8 string | the root cause class |
 
-That's a complete forensic record: what failed, why, and exactly where it came from. Note the types — they are **raw bytes**, not strings, for the numeric ones. Decoding them is Lesson 22.
+Now the part that catches everyone, and that most tutorials get wrong.
+
+`kafka_dlt-exception-fqcn` does **not** hold your exception. When a `@KafkaListener` method throws, Spring wraps it in a `ListenerExecutionFailedException` before the error handler ever sees it, and that wrapper is what gets recorded. Your `IllegalArgumentException` from Lesson 16 appears in `kafka_dlt-exception-cause-fqcn` instead.
+
+So filtering a dead-letter topic by `kafka_dlt-exception-fqcn` for your own exception type returns nothing at all, and the emptiness looks like an absence of failures rather than a mistake in your query. Lesson 22 decodes these headers and proves it.
 
 ### Retention: longer than the source
 
-The source topic keeps 7 days. The DLT keeps **30**.
+The source topic keeps records for 7 days. The dead-letter topic should keep them for longer, for a simple operational reason: a failure needs a longer investigation window than a success.
 
-The asymmetry is deliberate. A record on the source topic is either processed within seconds or it isn't. A record on the DLT is waiting for a *human*: someone to notice the alert, read the exception, understand the bug, ship a fix, and replay.
+A record fails on a Friday evening. Nobody looks until Monday. With matching retention you have four days left; with 30 days you have four weeks, and time to deploy a fix before deciding whether to replay.
 
-Seven days is not enough for that. A failure on a Friday before a holiday needs to still be there when someone looks.
+The size cap deserves the opposite treatment. Lesson 09's fourth quiz question showed that `retention.bytes` and `retention.ms` are an OR, so a size cap can quietly delete records long before the time limit. On a dead-letter topic that is exactly wrong, so set `retention.bytes` to `-1`, meaning unlimited, and let time be the only thing that deletes a failure.
 
-The DLT also sets `retention.bytes = -1` — no size cap at all. From Lesson 09: retention is an OR, and whichever limit trips first wins. A size cap on a DLT could silently delete failed records before the time window expires, which defeats the entire purpose.
-
-### The DLT producer
-
-Publishing to the DLT means the *consumer application* now produces. It needs producer configuration:
-
-```yaml
-spring:
-  kafka:
-    bootstrap-servers: localhost:9092,...   # top level — shared
-
-    consumer:
-      ...
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.apache.kafka.common.serialization.StringSerializer
-      acks: all
-      retries: 3
+```mermaid
+flowchart LR
+    S["wikimedia-stream<br/>partition 1"] --> L["listener throws"]
+    L --> H["DefaultErrorHandler<br/>backoff, then stop"]
+    H --> R["DeadLetterPublishingRecoverer"]
+    R --> D["wikimedia-stream.dlt<br/>partition 1<br/>same bytes, plus headers"]
+    H -.->|"offset advances,<br/>partition unblocked"| S
 ```
-
-This is why `bootstrap-servers` lives at the top level rather than under `consumer:` — both the `ConsumerFactory` and the `ProducerFactory` inherit it.
-
-`acks: all` on the DLT producer matters more than you'd think. If publishing to the DLT fails, the record is lost *and* you've lost the diagnostic. The one write you cannot afford to lose is the one recording that a write failed.
 
 ---
 
 ## Hands-on
 
-### 1. Declare the DLT
+### 1. Declare the dead-letter topic
 
-Add to `config/WikimediaTopicConfig.java` in the **consumer** — the consumer owns the DLT, because the consumer is what writes to it:
+Create `src/main/java/com/example/wikimedia/consumer/config/WikimediaTopicConfig.java`. This is a new file in the consumer project, and it is the first `NewTopic` declaration on this side of the pipeline.
+
+The consumer owns this topic rather than the producer, and the reason is worth stating: the consumer is what fails, so the consumer is what needs somewhere to put failures. The producer has no interest in this topic and should not create it.
 
 ```java
-package com.javaguy.consumer.config;
+package com.example.wikimedia.consumer.config;
 
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
@@ -149,64 +130,31 @@ import org.springframework.kafka.config.TopicBuilder;
 public class WikimediaTopicConfig {
 
     @Bean
-    public NewTopic wikimediaStreamTopic() {
-        return TopicBuilder
-                .name("wikimedia-stream")
-                .partitions(3)
-                .replicas(3)
-                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2")
-                .config(TopicConfig.RETENTION_MS_CONFIG, "604800000")      // 7 days
-                .config(TopicConfig.RETENTION_BYTES_CONFIG, "10737418240") // 10 GiB
-                .config(TopicConfig.COMPRESSION_TYPE_CONFIG, "snappy")
-                .build();
-    }
-
-    /**
-     * Same partition count as the source so DeadLetterPublishingRecoverer can route a
-     * failed record to the matching partition number, preserving per-key ordering.
-     *
-     * Retention is 30 days — a failed record waits for a human, not a retry. Size-based
-     * eviction is disabled (-1) so nothing is deleted before that window expires.
-     */
-    @Bean
     public NewTopic wikimediaStreamDltTopic() {
         return TopicBuilder
                 .name("wikimedia-stream.dlt")
+                // At least as many partitions as the source, because the recoverer
+                // publishes to the same partition number the record failed on.
                 .partitions(3)
                 .replicas(3)
                 .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2")
-                .config(TopicConfig.RETENTION_MS_CONFIG, "2592000000")  // 30 days
-                .config(TopicConfig.RETENTION_BYTES_CONFIG, "-1")       // time-only eviction
+                // 30 days. A failure needs a longer investigation window than a success.
+                .config(TopicConfig.RETENTION_MS_CONFIG, "2592000000")
+                // Unlimited size. Retention is an OR, and a size cap would delete
+                // failures before the 30 days elapsed.
+                .config(TopicConfig.RETENTION_BYTES_CONFIG, "-1")
                 .build();
     }
 }
 ```
 
-### 2. Add producer config to the consumer
+### 2. Give the consumer a producer
 
-`application.yml`:
+Publishing to the dead-letter topic means producing, so the consumer application now needs producer configuration. Add it under `spring.kafka` in `application.yml`, as a sibling of `consumer:`:
 
 ```yaml
-spring:
-  kafka:
-    bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
-
-    consumer:
-      group-id: wikimedia-consumer-group
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      enable-auto-commit: false
-      max-poll-records: 500
-      properties:
-        isolation.level: read_committed
-        session.timeout.ms: 45000
-        heartbeat.interval.ms: 15000
-        max.poll.interval.ms: 300000
-
-    # Used only by DeadLetterPublishingRecoverer. This application produces to no
-    # user-facing topic. acks=all because losing the record that records a failure
-    # is the worst possible loss.
+    # Used only by DeadLetterPublishingRecoverer. This application does not
+    # produce to any user-facing topic.
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
@@ -214,12 +162,16 @@ spring:
       retries: 3
 ```
 
-### 3. Wire the recoverer
+`bootstrap-servers` is already declared at the `spring.kafka` level rather than under `consumer:`, which Lesson 15 did deliberately for exactly this moment. Both the consumer factory and the producer factory inherit it.
 
-`KafkaConsumerConfig`:
+`acks: all` on a dead-letter producer is not optional. A dead-letter record is the only remaining copy of a failure, so losing it because one replica acknowledged and then died would defeat the entire mechanism.
+
+### 3. Wire the recoverer into the error handler
+
+Update `KafkaConsumerConfig`:
 
 ```java
-package com.javaguy.consumer.config;
+package com.example.wikimedia.consumer.config;
 
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
@@ -236,31 +188,33 @@ import org.springframework.util.backoff.ExponentialBackOff;
 public class KafkaConsumerConfig {
 
     /**
-     * Routes a failed record to wikimedia-stream.dlt on the SAME partition number as
-     * the source, so per-partition ordering survives on the DLT side.
-     *
-     * Spring Kafka adds diagnostic headers automatically — original topic, partition,
-     * offset, timestamp, exception class, message, and root cause. See Lesson 22.
+     * Publishes a failed record to <topic>.dlt, on the same partition number it
+     * failed on, so that per-partition ordering survives into the dead-letter topic.
      */
     @Bean
     public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(
             KafkaTemplate<String, String> kafkaTemplate) {
+
         return new DeadLetterPublishingRecoverer(kafkaTemplate,
-                (record, ex) -> new TopicPartition(
-                        record.topic() + ".dlt",
-                        record.partition()));
+                (record, exception) ->
+                        new TopicPartition(record.topic() + ".dlt", record.partition()));
     }
 
+    /**
+     * Retry schedule, per record: immediate, then after 1s, 2s and 4s.
+     * ExponentialBackOff sums the intervals it hands out, so maxElapsedTime of
+     * 7,000 permits exactly four attempts. Then the recoverer runs.
+     */
     @Bean
     public DefaultErrorHandler errorHandler(DeadLetterPublishingRecoverer recoverer) {
         var backoff = new ExponentialBackOff(1_000L, 2.0);
         backoff.setMaxInterval(10_000L);
-        backoff.setMaxElapsedTime(7_000L); // 1s + 2s + 4s → three retries, then recover
+        backoff.setMaxElapsedTime(7_000L);
 
         var handler = new DefaultErrorHandler(recoverer, backoff);
 
-        // Data-level failures never fix themselves. Skip the backoff and park the
-        // record immediately rather than block the partition for 7 seconds first.
+        // A malformed record will never parse. Skip the backoff and dead-letter it
+        // immediately rather than blocking the partition for seven seconds first.
         handler.addNotRetryableExceptions(IllegalArgumentException.class);
 
         return handler;
@@ -273,190 +227,198 @@ public class KafkaConsumerConfig {
 
         var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
         factory.setConsumerFactory(consumerFactory);
-        factory.setCommonErrorHandler(errorHandler);
         factory.setConcurrency(3);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-        factory.getContainerProperties().setPollTimeout(3_000);
-        factory.getContainerProperties().setObservationEnabled(true);
+        factory.setCommonErrorHandler(errorHandler);
+
         return factory;
     }
 }
 ```
 
-The `KafkaTemplate<String, String>` bean comes from Spring Boot's auto-configuration, built from the `spring.kafka.producer.*` block you just added.
+The `KafkaTemplate<String, String>` is injected, not constructed. Spring Boot auto-configures it from the `producer:` block you just added, which is the same starter-provides-the-bean point from Lesson 08.
 
-### 4. Trigger a non-retryable failure
+### 4. Send a record to its death
 
-Start the consumer. Produce garbage:
+Start the consumer, then produce a poison pill:
 
 ```bash
 echo 'this is not json' | docker exec -i kafka-1 kafka-console-producer \
   --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-```
-ERROR ... Unparseable Wikimedia event [partition=1 offset=8423]
-ERROR ... Backoff none exhausted for wikimedia-stream-1@8423
-INFO  ... Saved | partition=1 offset=8424 ...
+The consumer logs the failure once, with no backoff, because `IllegalArgumentException` is non-retryable. Then look at the dead-letter topic:
+
+```bash
+docker exec kafka-1 kafka-get-offsets \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt
 ```
 
-One attempt, no backoff, and the pipeline continues. Now look where the record went:
+One record. And read it:
 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server kafka-1:29092 \
   --topic wikimedia-stream.dlt \
   --from-beginning --max-messages 1 \
-  --property print.partition=true
+  --formatter-property print.headers=true \
+  --formatter-property print.partition=true
 ```
 
+The value is `this is not json`, byte-identical to what you produced. The headers carry the diagnosis.
+
+### 5. Confirm which exception is recorded
+
+Look carefully at the header output:
+
 ```
-Partition:1	this is not json
-```
-
-**Partition 1** — the same partition it occupied on the source topic. The value is the original bytes, untouched.
-
-### 5. Trigger a retryable failure
-
-Add a temporary failure that is *not* on the non-retryable list:
-
-```java
-    if (record.value().contains("Nikola Tesla")) {
-        throw new IllegalStateException("Simulated processing failure");
-    }
+kafka_dlt-exception-fqcn:org.springframework.kafka.listener.ListenerExecutionFailedException
+kafka_dlt-exception-cause-fqcn:java.lang.IllegalArgumentException
 ```
 
-Wait for a matching edit (or produce one by hand). Watch the timestamps: four attempts at 1 s, 2 s, 4 s, then the record lands on the DLT with `kafka_dlt-exception-fqcn = java.lang.IllegalStateException`.
+Your exception is in the **cause** header, not the primary one, because Spring wrapped it before the error handler saw it.
 
-Same destination, very different path. The retryable exception got its chance; the malformed one did not.
+Note this now. It is the single most common mistake made when querying a dead-letter topic, and Lesson 22 builds a consumer that reads the right header.
 
-Remove the simulated failure.
+You will also see `kafka_dlt-original-partition` printed as something unreadable. That is a four-byte integer being displayed as text, and decoding it properly is Lesson 22's main exercise.
 
-### 6. Confirm the topic configuration
+### 6. Confirm the partition mapping
+
+Produce poison pills with keys that hash to different partitions, using the keys you verified in Lesson 04:
 
 ```bash
-docker exec kafka-1 kafka-topics \
+printf 'en.wikipedia:bad-1\nde.wikipedia:bad-2\nfr.wikipedia:bad-3\n' \
+  | docker exec -i kafka-1 kafka-console-producer \
+    --bootstrap-server kafka-1:29092 --topic wikimedia-stream \
+    --reader-property parse.key=true --reader-property key.separator=:
+```
+
+Then compare the per-partition offsets on both topics:
+
+```bash
+docker exec kafka-1 kafka-get-offsets --bootstrap-server kafka-1:29092 --topic wikimedia-stream
+docker exec kafka-1 kafka-get-offsets --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt
+```
+
+Each failure appears on the dead-letter partition matching its source partition: partition 1 for `en.wikipedia`, 0 for `de.wikipedia`, 2 for `fr.wikipedia`.
+
+### 7. Confirm the partition is no longer blocked
+
+```bash
+docker exec kafka-1 kafka-consumer-groups \
   --bootstrap-server kafka-1:29092 \
-  --describe --topic wikimedia-stream.dlt | head -1
+  --describe --group wikimedia-consumer-group
 ```
 
-```
-Topic: wikimedia-stream.dlt  PartitionCount: 3  ReplicationFactor: 3
-  Configs: min.insync.replicas=2,retention.ms=2592000000,retention.bytes=-1
-```
+Lag is clear on every partition. Compare that with Lesson 20's step 1, where one partition was frozen indefinitely.
 
-Three partitions to match the source. Thirty days. No size cap.
+That is the whole point of a recoverer: once it returns, the container advances the offset. The difference from Lesson 20 is not that the partition unblocks, it is that the record still exists somewhere.
 
 ---
 
 ## Try it yourself
 
-1. Change the recoverer to route to partition `0` always. Produce three malformed records that would have gone to partitions 0, 1, and 2. What have you gained, and what have you given up? Now imagine replaying them.
+1. Declare the dead-letter topic with `.partitions(1)` instead of 3, delete and recreate it, then produce a record that fails on source partition 2. Read the error carefully. Which component failed, and what happened to the record?
 
-2. Declare the DLT with `.partitions(1)` while the source has 3. Produce a record that fails on source partition 2. What happens inside `DeadLetterPublishingRecoverer`, and where does the record end up?
+2. Set `retention.bytes` to something small such as `1024` alongside the 30-day `retention.ms`, then produce enough failures to exceed it. Which limit wins, and what does that tell you about relying on the time value alone?
 
-3. Stop all three brokers, then trigger a listener failure. Where does the DLT record go? What does this tell you about the DLT as a durability mechanism? (Hint: publishing to the DLT is a produce, and it can fail.)
+3. Remove `acks: all` from the dead-letter producer, leaving the default. Look up what the default actually is in Kafka 4, then explain whether this change is dangerous or a no-op.
 
-4. Set the DLT's `retention.bytes` to `1048576` (1 MiB) alongside its 30-day `retention.ms`. Publish a few MB of failed records. Which limit wins, and why is this the worst possible topic to get that wrong on?
+4. Route by exception type instead of by partition: send `IllegalArgumentException` failures to `wikimedia-stream.invalid` and everything else to `wikimedia-stream.dlt`. What do you gain operationally, and which guarantee from this lesson do you give up?
 
 ---
 
 ## Common mistakes
 
-**Giving the DLT fewer partitions than the source.**
-Same-partition routing throws. The recoverer's publish fails, and the failure of the failure-handler is not somewhere you want to be.
+**Giving the dead-letter topic fewer partitions than the source.**
+Same-partition routing then publishes to a partition that does not exist, and the recoverer itself fails.
 
-**Letting `DeadLetterPublishingRecoverer` use its default topic name.**
-It appends `.DLT` (uppercase). If your topic config declares `.dlt`, auto-creation makes a second topic and your DLT consumer watches an empty one.
+**Querying `kafka_dlt-exception-fqcn` for your own exception type.**
+It holds `ListenerExecutionFailedException`. Yours is in the cause header, and the empty result set looks like good news.
 
-**Setting `acks=1` on the DLT producer.**
-The record you cannot afford to lose is the one documenting a loss.
+**Matching the source topic's retention.**
+A Friday failure needs to survive until Monday, and then until a fix ships.
 
-**Putting a `retention.bytes` cap on the DLT.**
-Retention is an OR. Failed records get silently deleted before anyone investigates.
+**Leaving a size cap on the dead-letter topic.**
+Retention is an OR, so the cap silently deletes failures before the time limit.
 
-**Forgetting the DLT is a real topic that fills up.**
-Nobody consumes it by default. It accumulates for 30 days. If your producer starts emitting malformed records at scale, the DLT absorbs the whole firehose.
+**Forgetting that the consumer now needs producer configuration.**
+The recoverer produces, so the application needs a `KafkaTemplate` and somewhere to send it.
 
-**Assuming a DLT record means the data is safe.**
-It means the data is *parked*. If nobody consumes and acts on the DLT, you have relocated your data loss by 30 days.
+**Using `acks=1` for dead-letter writes.**
+The dead-letter record is the last remaining copy of the failure.
+
+**Mixing `.DLT` and `.dlt`.**
+Two different topics, and with auto-creation enabled you would end up with both.
 
 ---
 
 ## Check your understanding
 
-**1. Why route a failed record to the same partition number on the DLT rather than letting the partitioner choose?**
+**1. Why publish the failed record to the same partition number it failed on?**
 
 <details>
 <summary>Reveal answer</summary>
 
-To preserve relative ordering among failures.
+To preserve the ordering that the key bought you in the first place.
 
-Records sharing a source partition did so because they shared a key, which is how you asked Kafka to keep them ordered. If three failures for the same key scatter across three DLT partitions, they become three independent logs with no order between them.
+Records sharing a partition on the source shared it because they shared a key, and per-key ordering was the reason for keying them. If several failures for one key were scattered across dead-letter partitions, reading them back later would give you no ordering guarantee at all, and a replay could apply an update before the creation it depends on.
 
-Replaying them would then apply them in an arbitrary interleaving — potentially an update before its create. Same-partition routing means DLT partition 1 contains exactly the failures from source partition 1, in the order they failed, and a replay of that partition is ordered.
-
-It's also why the DLT needs at least as many partitions as the source: you cannot publish to partition 2 of a one-partition topic.
+Same-partition routing means partition 1 of the dead-letter topic holds partition 1's failures, in the order they failed, so a replay can preserve the order that mattered.
 
 </details>
 
-**2. Your DLT has 30-day retention and `retention.bytes = 10485760` (10 MiB). A bad deploy sends 500 MiB of failures. What do you have 30 days later?**
+**2. Your dead-letter topic keeps records for 30 days and the source keeps 7. Why not match them?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Roughly 10 MiB of the *most recent* failures, and the rest deleted — probably within minutes of the bad deploy, long before anyone investigated.
+Because the two topics answer different questions on different timescales.
 
-Retention is an OR: a segment is eligible for deletion when it exceeds *either* the time or the size limit. The size limit tripped first, so Kafka deleted the oldest segments while the incident was still unfolding.
+The source topic's retention bounds how far you can replay normal traffic, and 7 days is a capacity decision. The dead-letter topic's retention bounds how long you have to notice a failure, diagnose it, ship a fix, and decide whether to replay. That is human time, and it includes weekends.
 
-The records you most want are the earliest ones — the first failures, closest to the root cause. Those are exactly the ones the size cap threw away.
-
-This is why the DLT sets `retention.bytes = -1`. On a DLT, time should be the only thing that deletes a record. Set a size cap and you've built a mechanism that discards evidence precisely when there's the most of it.
+Matching them would mean a failure that happened last Friday has already expired by the time you have a fix ready, and the only record of it is a log line.
 
 </details>
 
-**3. A record fails with `IllegalArgumentException` and one with `IllegalStateException`. Both end up on the DLT. What was different?**
+**3. A record is dead-lettered. Has the consumer group's lag gone up or down?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The path, not the destination.
+Down, and that is the part worth understanding.
 
-`IllegalArgumentException` is registered via `addNotRetryableExceptions`, so the error handler skipped the backoff entirely — one attempt, then straight to the recoverer. The partition was blocked for milliseconds.
+Once the recoverer has published the record, the container treats it as handled and the offset advances, so the partition resumes and lag clears. That is the difference between this and Lesson 20's blocked partition.
 
-`IllegalStateException` isn't registered, so it got the full `ExponentialBackOff` schedule: four attempts at 0 s, 1 s, 2 s, 4 s. The partition was blocked for about seven seconds while the handler gave the record every chance to succeed.
-
-The classification decides *how much you're willing to pay* before giving up. For a transient database outage, seven seconds is a bargain. For malformed JSON, it's seven seconds of blocked partition in exchange for four identical failures.
+It also means lag is now a poor signal for this failure mode. The pipeline reports itself healthy while records accumulate on the dead-letter topic, so the metric to watch is the dead-letter topic's own message rate. Lesson 26 wires that up.
 
 </details>
 
-**4. Publishing to the DLT is itself a Kafka produce. What happens if it fails?**
+**4. Why does the consumer declare the dead-letter topic rather than the producer?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The recoverer throws, the error handler cannot complete, and the record is **not** committed — so the consumer will redeliver it and try the whole retry-and-recover sequence again on the next poll.
+Because the consumer is what fails, so the consumer is what needs somewhere to put failures.
 
-That's the good outcome, and it's why `acks=all` on the DLT producer matters: a failed publish is retried rather than silently dropped.
+The producer has no relationship with this topic. It never reads from it, never writes to it, and would have no reason to know it exists. Declaring it there would couple the producer to a consumer's error-handling strategy, and a second consumer group with a different strategy would need a topic the producer knew nothing about.
 
-The bad outcome is the DLT being unavailable for an extended period — the brokers are down, or `min.insync.replicas` isn't satisfied. Then the consumer is stuck in a loop: fail, retry, fail to publish, redeliver. The partition blocks, exactly as it did before you had a DLT.
-
-A dead-letter topic on the same cluster as the source topic does not protect you from that cluster being down. It protects you from *bad records*, which is a different failure class entirely. Treating it as a durability mechanism is a category error.
+The general rule is that a topic is declared by whichever application's behaviour depends on its configuration. The partition count on this topic exists to match the recoverer's routing, and that routing lives in the consumer.
 
 </details>
 
-**5. Six months after adding a DLT, an engineer notices `wikimedia-stream.dlt` holds 40,000 records. Alerts never fired, lag was always zero. What went wrong, and where?**
+**5. What exactly makes replay possible, given that all you have is a record on another topic?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Nothing in the Kafka configuration. The DLT did exactly its job: it absorbed 40,000 unprocessable records, kept the partitions flowing, and preserved every one for inspection.
+That the key and value are the original bytes, unmodified.
 
-What failed is the human loop. A DLT is a **parking lot, not a solution**. Records land there and stay there. Consumer lag on the *source* topic stays at zero because those records were successfully removed from the source's path — that's the point.
+`DeadLetterPublishingRecoverer` adds headers and changes the destination, and it does not touch the payload. So the record on the dead-letter topic is byte-identical to the one that failed, which means producing it back to the source topic recreates the exact input.
 
-So the monitoring gap: nobody alerted on the DLT's message count, or its produce rate, or ran a consumer over it. The 40,000 records represent 40,000 events that never reached the database, and after 30 days the oldest ones are gone forever.
+That is also why the headers matter so much. The payload alone tells you what failed but not why or where it came from, and without the original partition and offset you cannot correlate it with anything else that happened at the time.
 
-The fix is to treat DLT arrivals as a paging-worthy event: a metric incremented on every publish, an alert on a non-zero rate, and a consumer that at minimum persists and reports them. Which is what Lesson 22 builds.
+Lesson 22 decodes those headers and then walks through why replay is harder than producing the bytes back.
 
 </details>
 
@@ -464,8 +426,12 @@ The fix is to treat DLT arrivals as a paging-worthy event: a metric incremented 
 
 ## Recap
 
-`DeadLetterPublishingRecoverer` is the third option: instead of blocking the partition or silently dropping the record, park it on another topic with the original bytes intact and seven diagnostic headers attached. Route it to the same partition number to preserve ordering, give it thirty days and no size cap because it's waiting on a human, and use `acks=all` because losing the record of a loss is the worst outcome available.
+A recoverer is what `DefaultErrorHandler` calls when retries are exhausted, and `DeadLetterPublishingRecoverer` publishes the failed record to another topic instead of dropping it. Routing to the same partition number preserves the ordering the key was there to provide, which requires the dead-letter topic to be at least as wide as the source.
 
-Records are now landing on `wikimedia-stream.dlt`, and nobody is looking at them.
+The record's payload is preserved byte for byte, with diagnostic headers added. The exception header holds Spring's wrapper, and your exception is in the cause header.
 
-**Next:** [Lesson 22 — DLT headers & replay →](22-dlt-headers-and-replay.md)
+The dead-letter topic gets 30 days of retention and no size cap, because a failure needs a longer investigation window than a success and because retention limits are an OR.
+
+Lag now clears when a record fails, which means lag has stopped being the metric that tells you about this failure.
+
+**Next:** [Lesson 22: DLT Headers and Replay](22-dlt-headers-and-replay.md)

@@ -1,37 +1,35 @@
-# Lesson 15 — Your First `@KafkaListener`
+# Lesson 15: Your First KafkaListener
 
-> **Part 3 — The Consumer** · 25 minutes
+> **Part 3: The Consumer**
 
 ---
 
 ## What you'll learn
 
-- How `@KafkaListener` turns a method into a consumer group member
-- What `groupId` and `auto-offset-reset` decide, and when each one applies
-- What the poll loop is, and why it exists even though you never call `poll()`
-- How to read a `ConsumerRecord` and see the partition and offset your record came from
+- What the listener container does on your behalf, and what you inherit from it
+- Why `groupId` is the most consequential string in a consumer application
+- When `auto-offset-reset` applies, which is rarer than most people think
+- Why deserializers must mirror serializers exactly
 
 ---
 
 ## Why this matters
 
-Everything in Part 1 you did by hand: joined a group, read records, watched offsets move. `@KafkaListener` does all of it for you in one annotation, and that's exactly the danger. Three lines of code hide a background thread, a group membership, a rebalance protocol, and an offset commit strategy.
+Part 2 built a producer that publishes live Wikimedia edits. Nothing reads them. Everything you learned about consumer groups, offsets and lag in Lesson 05 was done from the CLI, and this is where it becomes an application.
 
-You already understand every one of those. This lesson connects the annotation to the machinery you've seen.
+The consumer side is also where Kafka's failure modes get interesting. A producer either publishes or does not. A consumer can process a record twice, lose one, block a partition, or silently stop reading, and each of those has a specific cause you can control.
 
 ---
 
 ## Before you start
 
-[Lesson 14](14-wikimedia-sse-stream.md), and a producer that can fill the topic. Cluster healthy.
-
-You'll build the consumer as a **second Spring Boot application**, on port 8082. Producer and consumer are separate services, as they'd be in production.
+[Lesson 14](14-wikimedia-sse-stream.md), and a producer that can fill the topic. Records already in `wikimedia-stream` are ideal, because you will watch them replay.
 
 ---
 
 ## The concept
 
-### The poll loop you never write
+### The listener container
 
 The raw Kafka consumer API is a loop:
 
@@ -45,54 +43,65 @@ while (true) {
 }
 ```
 
-Spring's **listener container** runs this loop on a background thread and calls your annotated method once per record. `@KafkaListener` is the annotation that registers your method with a container.
+Spring's **listener container** runs that loop on a background thread and calls your annotated method once per record. `@KafkaListener` registers your method with a container.
 
-This matters because the loop has properties you inherit whether you know it or not:
+This matters because the loop has properties you inherit whether or not you know about them:
 
-- **A single thread owns a consumer**, and it must return to `poll()` regularly. If your method takes longer than `max.poll.interval.ms` (5 minutes by default), the broker assumes you're dead and rebalances your partitions away.
-- **Records are delivered in batches**, then handed to you one at a time. `max-poll-records` (500) caps how many arrive per `poll()`.
-- **Polling is what sends heartbeats** — well, it used to be. Modern clients heartbeat on a separate thread, which is why `session.timeout.ms` and `max.poll.interval.ms` are two different settings.
+- **A single thread owns a consumer**, and it must return to `poll()` regularly. If your method takes longer than `max.poll.interval.ms`, five minutes by default, the group decides you are dead and your partitions are reassigned.
+- **Records arrive in batches and are handed to you one at a time.** `max-poll-records`, default 500, caps how many arrive per poll. It is not a batch size for your method.
+- **Heartbeating is separate from polling.** Modern clients heartbeat on their own thread, which is why `session.timeout.ms` and `max.poll.interval.ms` are two different settings, covered in Lesson 19.
 
-### `groupId` — the most consequential string in your app
+```mermaid
+flowchart TD
+    C["Listener container thread"] --> P["poll()"]
+    P --> R{"records returned?"}
+    R -->|"yes"| L["your @KafkaListener method,<br/>once per record"]
+    R -->|"no"| P
+    L --> CM["commit position"]
+    CM --> P
+    H["heartbeat thread"] -.->|"independent of poll()"| G["group coordinator"]
+```
+
+### `groupId`, the most consequential string in the application
 
 From Lesson 05: a group owns committed offsets, and within a group each partition goes to exactly one member.
 
-`@KafkaListener(groupId = "wikimedia-consumer-group")` joins that group. Two consequences that catch people out:
+Two consequences catch people out.
 
-**Two applications sharing a `groupId` split the partitions.** Each sees only *some* records. If `billing` and `analytics` both use `"my-group"`, each processes roughly half the events and both look like they're working. This is a nasty bug because there's no error — just silent, partial data.
+**Two applications sharing a `groupId` split the partitions.** Each sees only some records. If two unrelated services both use `my-group`, each processes roughly half the events and both appear to work. There is no error, just silent partial data.
 
-**Changing the `groupId` resets your position.** A new group has no committed offsets, so `auto-offset-reset` decides where it starts. Renaming a group in a config file can replay your entire topic, or skip everything in it.
+**Changing the `groupId` resets your position.** A new group has no committed offsets, so `auto-offset-reset` decides where it starts. Renaming a group in a configuration file can replay an entire topic, or skip everything in it.
 
-### `auto-offset-reset` — only for a group with no offset
+### `auto-offset-reset` applies only when there is no offset
 
 ```yaml
 auto-offset-reset: earliest
 ```
 
-This applies in exactly one situation: **the group has no valid committed offset for a partition.** That happens when the group is brand new, or when its committed offset points at a record that retention has already deleted.
+This is consulted in exactly one situation: the group has no valid committed offset for a partition. That happens when the group is brand new, or when its committed offset points at a record retention has already deleted.
 
 | Value | Behaviour |
 |---|---|
 | `earliest` | start at the oldest retained record |
-| `latest` | start at the end — only records produced from now on |
+| `latest` | start at the end, taking only records produced from now on |
 | `none` | throw an exception |
 
-The default is `latest`. That's why `kafka-console-consumer` printed nothing in Lesson 03 until you passed `--from-beginning`.
+The default is `latest`, which is why `kafka-console-consumer` printed nothing in Lesson 03 until you passed `--from-beginning`.
 
-Once the group *has* committed an offset, this setting is ignored entirely. It is not "always start from the beginning" — it is "where do I start when I have no idea where I was."
+Once the group has a committed offset this setting is ignored entirely. It is not "always start from the beginning". It is "where do I start when I have no idea where I was".
 
-Choose `earliest` when reprocessing history is safe and desirable. Choose `latest` for a live dashboard where old events are worthless. Choose `none` when a missing offset means something has gone badly wrong and you'd rather crash than guess.
+Choose `earliest` when reprocessing history is safe. Choose `latest` for a live dashboard where old events are worthless. Choose `none` when a missing offset means something has gone badly wrong and you would rather fail than guess.
 
 ### Deserializers mirror serializers
 
-The producer serialized `String → byte[]`. The consumer must do the reverse:
+The producer serialised `String` to `byte[]`, so the consumer must reverse it:
 
 ```yaml
 key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 ```
 
-These must correspond to what the producer wrote. Deserialize Avro bytes with a `StringDeserializer` and you get mojibake, not an exception — which is one of several reasons Lesson 25 exists.
+These must correspond to what the producer wrote. Deserialise Avro bytes with a `StringDeserializer` and you get unreadable text rather than an exception, which is one of several reasons Lesson 25 exists.
 
 ---
 
@@ -100,7 +109,23 @@ These must correspond to what the producer wrote. Deserialize Avro bytes with a 
 
 ### 1. Create the consumer project
 
-A second app: group `com.javaguy`, artifact `consumer`, Java 25, Spring Boot 4.1.0.
+Generate a second project from [start.spring.io](https://start.spring.io), alongside the producer:
+
+| Field | Value |
+|---|---|
+| Project | Maven |
+| Spring Boot | 4.1.0 |
+| Group | `com.example.wikimedia` |
+| Artifact | `wikimedia-consumer` |
+| Java | 25 |
+| Dependencies | Spring for Apache Kafka, Spring Boot Actuator |
+
+```
+kafka-course/
+├── docker-compose.yml
+├── wikimedia-producer/
+└── wikimedia-consumer/
+```
 
 `pom.xml`:
 
@@ -118,8 +143,8 @@ A second app: group `com.javaguy`, artifact `consumer`, Java 25, Spring Boot 4.1
         <relativePath/>
     </parent>
 
-    <groupId>com.javaguy</groupId>
-    <artifactId>consumer</artifactId>
+    <groupId>com.example.wikimedia</groupId>
+    <artifactId>wikimedia-consumer</artifactId>
     <version>0.0.1-SNAPSHOT</version>
 
     <properties>
@@ -127,11 +152,14 @@ A second app: group `com.javaguy`, artifact `consumer`, Java 25, Spring Boot 4.1
     </properties>
 
     <dependencies>
-        <!-- The starter, not org.springframework.kafka:spring-kafka.
-             See Lesson 08 — the bare library gives you no auto-configuration. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-kafka</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
         <dependency>
@@ -152,16 +180,18 @@ A second app: group `com.javaguy`, artifact `consumer`, Java 25, Spring Boot 4.1
 </project>
 ```
 
+Actuator is included from the start here, because a consumer's lag and listener state are the things you will want to see in Lesson 19 and Lesson 26.
+
 ### 2. `src/main/resources/application.yml`
 
 ```yaml
 spring:
   application:
-    name: consumer
+    name: wikimedia-consumer
 
   kafka:
-    # Declared at the top level, not under consumer:, because the DLT producer
-    # in Lesson 21 will need it too.
+    # Declared at the top level rather than under consumer:, because the
+    # dead-letter producer in Lesson 21 needs it as well.
     bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
 
     consumer:
@@ -174,20 +204,29 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 
-      # How many records one poll() may return. Not a batch size for your method —
-      # Spring still hands them to you one at a time.
+      # How many records one poll() may return. Spring still hands them to your
+      # method one at a time.
       max-poll-records: 500
 
 server:
   port: 8082
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
 ```
 
-Note `server.port: 8082`. The producer owns 8081.
+`server.port: 8082`, because the producer owns 8081 and Kafka UI owns 8080.
 
 ### 3. `ConsumerApplication.java`
 
 ```java
-package com.javaguy.consumer;
+package com.example.wikimedia.consumer;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -201,10 +240,10 @@ public class ConsumerApplication {
 }
 ```
 
-### 4. `consumer/WikimediaConsumer.java`
+### 4. `src/main/java/com/example/wikimedia/consumer/kafka/WikimediaConsumer.java`
 
 ```java
-package com.javaguy.consumer.consumer;
+package com.example.wikimedia.consumer.kafka;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
@@ -222,63 +261,65 @@ public class WikimediaConsumer {
             groupId = "wikimedia-consumer-group"
     )
     public void consume(ConsumerRecord<String, String> record) {
-        log.info("Consumed | partition={} offset={} valueLength={}",
-                record.partition(), record.offset(), record.value().length());
+        log.info("Consumed key={} partition={} offset={} valueLength={}",
+                record.key(), record.partition(), record.offset(), record.value().length());
     }
 }
 ```
 
-Take `ConsumerRecord<String, String>` rather than a bare `String`. The bare version gives you the value and hides everything else. `ConsumerRecord` gives you `partition()`, `offset()`, `key()`, `timestamp()`, and `headers()` — and in Lesson 22 the headers are the whole point.
+Take a `ConsumerRecord<String, String>` rather than a bare `String`. The bare version gives you the value and hides everything else, while `ConsumerRecord` gives you `key()`, `partition()`, `offset()`, `timestamp()` and `headers()`. In Lesson 22 the headers are the whole point.
 
-> No `@EnableKafka` needed. Spring Boot's auto-configuration adds it when the starter is present.
+> No `@EnableKafka` is needed. Boot's auto-configuration adds it when the starter is present, which is the same starter-versus-library distinction from Lesson 08.
 
 ### 5. Run it
 
-Start the **consumer** first, then the producer. That ordering matters less than you'd think — `auto-offset-reset: earliest` means a brand-new group will read the whole topic anyway — but it's the habit to build.
+Start the consumer:
 
 ```bash
+cd wikimedia-consumer
 ./mvnw spring-boot:run
 ```
 
 If the topic already holds records from Part 2, they replay immediately:
 
 ```
-Consumed | partition=0 offset=0 valueLength=1834
-Consumed | partition=0 offset=1 valueLength=1502
-Consumed | partition=2 offset=0 valueLength=2011
-...
+Consumed key=Nikola Tesla partition=0 offset=0 valueLength=1834
+Consumed key=Berlin partition=0 offset=1 valueLength=1502
+Consumed key=Category:Living people partition=2 offset=0 valueLength=2011
 ```
 
-**Partitions interleave.** You'll see offsets from partition 0, then 2, then 1, then 0 again. Each partition is ordered internally; across partitions there is no order at all. Exactly as promised in Lesson 01, now visible in your own logs.
+Two things to notice.
 
-Now start the producer in another terminal, and trigger the stream:
+**The keys are page titles**, which is the producer's keying decision from Lesson 14 arriving intact on the consumer side.
+
+**Partitions interleave.** You will see offsets from partition 0, then 2, then 1, then 0 again. Each partition is ordered internally and there is no order at all across them, exactly as Lesson 01 promised and Lesson 04 demonstrated from the CLI.
+
+Now start the producer in another terminal and trigger the stream:
 
 ```bash
 curl http://localhost:8081/api/v1/wikimedia
 ```
 
-Live Wikipedia edits scroll past.
+Live edits scroll past.
 
-### 6. Prove `auto-offset-reset` only fires once
+### 6. Prove `auto-offset-reset` fires only once
 
-Stop the consumer. Restart it.
+Stop the consumer, then restart it.
 
-It does **not** replay from the beginning. It resumes from its committed offsets, because the group now has them. `auto-offset-reset: earliest` was consulted on the first run and ignored on the second.
+It does not replay from the beginning. It resumes from its committed offsets, because the group now has them. `auto-offset-reset: earliest` was consulted on the first run and ignored on the second.
 
-Now change `groupId` to `"wikimedia-consumer-group-v2"` and restart. Everything replays from offset 0 — a brand-new group with no offsets, so `earliest` applies again.
-
-Check both groups exist:
+Now change `groupId` in both `application.yml` and the annotation to `wikimedia-consumer-group-v2` and restart. Everything replays from offset 0, because that is a brand-new group with no offsets.
 
 ```bash
 docker exec kafka-1 kafka-consumer-groups \
   --bootstrap-server kafka-1:29092 --list
 ```
 
-Two groups, two independent positions over the same data. That's Lesson 05's independence, from Java.
+Two groups, two independent positions over the same data. That is Lesson 05's independence, now from Java.
 
 Change the `groupId` back before continuing.
 
-### 7. Watch the group from the outside
+### 7. Watch the group from outside
 
 While the consumer runs:
 
@@ -288,117 +329,114 @@ docker exec kafka-1 kafka-consumer-groups \
   --describe --group wikimedia-consumer-group
 ```
 
-```
-GROUP                    TOPIC            PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG CONSUMER-ID
-wikimedia-consumer-group wikimedia-stream 0         1322           1322           0   consumer-...-1
-wikimedia-consumer-group wikimedia-stream 1         1098           1098           0   consumer-...-2
-wikimedia-consumer-group wikimedia-stream 2         772            772            0   consumer-...-3
-```
+This is the same output you read in Lesson 05, now with populated `CONSUMER-ID`, `HOST` and `CLIENT-ID` columns, because there is a live member. One member holds all three partitions, since the group has one consumer. Lesson 19 changes that.
 
-`LAG 0` across all three, and a live `CONSUMER-ID` per partition. Your `@KafkaListener` is a fully paid-up member of the group you inspected by hand in Lesson 05.
+Stop the consumer and describe again. The group persists with its offsets and reports no active members, which is the state Lesson 05 showed you first.
 
 ---
 
 ## Try it yourself
 
-1. Add a second `@KafkaListener` method, in a different class, with the **same** `groupId` and the same topic. Run one instance of the app. Do both methods receive every record? Now give the second one a different `groupId`. What changed, and why?
+1. Set `auto-offset-reset: none` and use a group ID that has never existed. Read the exception. Then explain when this would be the setting you actually want in production.
 
-2. Add `Thread.sleep(400)` inside `consume()`. Watch the lag column climb. How long until the group is evicted, and which setting governs that — `session.timeout.ms` or `max.poll.interval.ms`?
+2. Start a second instance of the consumer with `SERVER_PORT=8083 ./mvnw spring-boot:run`. Describe the group. How were the three partitions split, and what happened to the log output of each instance?
 
-3. Set `auto-offset-reset: none` and use a brand-new `groupId`. What exception do you get, and why might that be the setting you actually want in a financial system?
+3. Change the listener parameter from `ConsumerRecord<String, String>` to `String` and run. Everything still works. What did you lose, and which later lesson would break first?
+
+4. Deliberately create the split-brain bug: give a second, differently named application the same `groupId` and the same topic. Confirm from the logs that each sees only some records, then explain why no error is raised anywhere.
 
 ---
 
 ## Common mistakes
 
-**Sharing a `groupId` between two different applications.**
-They split the partitions. Each app sees a subset of records and neither errors. Two apps needing all records need two group IDs.
+**Sharing a `groupId` between two applications that each need every record.**
+The partitions are split between them and each sees a subset. There is no error, and it looks like random data loss.
 
-**Believing `auto-offset-reset: earliest` always replays.**
-It only applies when the group has no committed offset. After the first run it is dead configuration.
+**Expecting `auto-offset-reset` to control every start.**
+It applies only when there is no committed offset. Once the group has one, it is ignored.
 
-**Changing `groupId` casually.**
-It's a position reset. With `earliest`, you reprocess everything; with `latest`, you skip everything currently pending.
+**Renaming a `groupId` casually.**
+That is a new group, so it replays from `earliest` or skips to `latest`. Both can be catastrophic depending on what your consumer does with a record.
 
-**Doing slow work inside the listener.**
-The thread must return to `poll()` within `max.poll.interval.ms`. Exceed it and the broker rebalances your partitions to someone else — while you're still working on them.
+**Mismatching deserializers.**
+The wrong deserializer often produces unreadable data rather than an exception.
 
-**Taking `String` instead of `ConsumerRecord`.**
-You lose partition, offset, key, timestamp, and headers. The value is rarely all you need.
+**Doing slow work in the listener method.**
+Exceeding `max.poll.interval.ms` makes the group treat you as dead and reassign your partitions. Lesson 19 covers the consequences.
 
-**Assuming records arrive in global order.**
-They arrive ordered per partition, interleaved across partitions.
+**Taking a bare `String` parameter.**
+You lose the partition, offset, key, timestamp and headers, and Lesson 22 needs all of them.
 
 ---
 
 ## Check your understanding
 
-**1. Your consumer has `auto-offset-reset: earliest`. It runs, processes 10,000 records, and you restart it. How many does it reprocess?**
+**1. You restart the consumer and it does not replay the topic, despite `auto-offset-reset: earliest`. Bug?**
 
 <details>
 <summary>Reveal answer</summary>
 
-None. It resumes exactly where it left off.
+No, that is the setting working correctly.
 
-`auto-offset-reset` is consulted only when the group has **no valid committed offset** for a partition. After the first run, `__consumer_offsets` holds a position for every partition, so the setting is never read.
+`auto-offset-reset` is consulted only when the group has no valid committed offset for a partition. Your first run committed offsets, so the second run resumed from them and never consulted the setting.
 
-The one exception: if the committed offset points to a record that retention has since deleted, the offset is no longer valid, and `earliest` kicks in again — silently replaying from the oldest retained record.
+To replay you need to remove the position rather than change the setting: reset the group's offsets with `kafka-consumer-groups --reset-offsets`, as in Lesson 05, or use a new group ID.
 
 </details>
 
-**2. Two teams deploy services that both read `orders`. Both used the default `groupId` from a copy-pasted config. What do they observe?**
+**2. Two services share `groupId: my-group` and each processes about half the records. Which of them is misconfigured?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Each service processes roughly half the orders, and neither logs an error.
+Both, and the fix is to stop sharing the group.
 
-Sharing a `groupId` makes them members of the **same consumer group**, so Kafka splits the partitions between them — that's the load-balancing behaviour from Lesson 05, working exactly as designed. With 3 partitions and 2 members, one gets 2 partitions and the other gets 1.
+A group is a unit of work division. Its partitions are distributed among members so that each record is processed once *by the group*, which is what you want for scaling one logical consumer and exactly wrong for two independent consumers.
 
-Both services look healthy. Lag is zero. Every order is processed exactly once — by one of the two services, unpredictably. The bug surfaces as "some orders never got an invoice," and it looks like data loss.
+Two applications that each need every record need two group IDs. That is the fan-out from Lesson 01, and it requires nothing more than a different string.
 
-Two applications that each need every record must use **different** group IDs.
+The reason this is nasty is that neither service errors. Each just sees a subset, and if both write to different destinations, both destinations look plausibly populated.
 
 </details>
 
-**3. You never call `poll()`. So what is actually fetching records, and why does that mean a slow listener method is dangerous?**
+**3. Your listener method takes 6 minutes on one record. What happens?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Spring's **listener container** runs the poll loop on a background thread. It calls `poll()`, receives up to `max-poll-records` records, and invokes your method once per record before returning to `poll()`.
+You exceed `max.poll.interval.ms`, which defaults to 5 minutes, so the group coordinator concludes this member is stuck and reassigns its partitions to someone else.
 
-Your method therefore executes *inside* the poll loop, on the consumer's thread. If processing 500 records takes longer than `max.poll.interval.ms` (default 5 minutes), the broker concludes the member is dead, evicts it from the group, and rebalances its partitions to another consumer — which starts reprocessing them from the last committed offset.
+Your method then finishes and the container tries to commit a position it no longer owns, which fails. The record is meanwhile being processed again by whichever member took over the partition, so slow processing turns into duplicate processing.
 
-Meanwhile your "dead" consumer is still working, and when it finishes and tries to commit, the commit fails because it no longer owns those partitions. Slow processing doesn't just add lag; it causes rebalance storms and duplicate work.
+Heartbeats do not save you. They run on a separate thread and keep reporting that the process is alive, which is precisely why there are two separate timeouts. Lesson 19 covers both.
 
 </details>
 
-**4. Your consumer logs offsets in the sequence 0, 0, 1, 0, 1, 2 with partitions 0, 2, 0, 1, 2, 0. Is anything wrong?**
+**4. The producer keys by page title. Your consumer logs show `key=Berlin` on partition 0 every time. Why is that guaranteed?**
 
 <details>
 <summary>Reveal answer</summary>
 
-No, that's correct behaviour.
+Because the partition is derived arithmetically from the key, as `murmur2(key) % partitionCount`, and neither the key nor the partition count is changing.
 
-Offsets are per partition — every partition has its own offset 0. The sequence shows partition 0 at offset 0, partition 2 at offset 0, partition 0 at offset 1, and so on. Within each partition the offsets increase monotonically, which is the only ordering Kafka promises.
+That is the affinity you predicted in Lesson 04 and confirmed from the broker in Lesson 13, now visible from the consumer side. Every edit to Berlin is in one partition, in the order it was produced, and read by one member of the group.
 
-A single `poll()` returns records from several partitions at once, and the container iterates them partition by partition. Interleaving across partitions is expected and unavoidable — it's the direct cost of the parallelism partitions buy you.
+It stops being guaranteed the moment someone increases the partition count, which is why Lesson 09 treated that as the one declaration you cannot casually edit.
 
 </details>
 
-**5. Why is `auto-offset-reset: none` a defensible choice for a payments system, when it makes the consumer throw on startup?**
+**5. `max-poll-records: 500` is set. Does your listener method receive 500 records?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because both alternatives silently do something wrong, and in payments "wrong" is expensive.
+No. It receives one record per call, five hundred times.
 
-If a committed offset has vanished — expired past retention, or the group was accidentally deleted — then `earliest` **reprocesses history**, potentially double-charging customers. And `latest` **skips every pending record**, silently dropping payments that were never processed.
+`max.poll.records` caps how many records a single `poll()` returns to the container. The container then iterates and invokes your method once per record.
 
-`none` throws `NoOffsetForPartitionException`. The consumer refuses to start, a human investigates, and someone makes a deliberate decision about where to resume.
+The setting still matters, because it decides how much work the container takes on between polls. Five hundred records that each take 10 milliseconds is 5 seconds of processing before the next `poll()`, which counts against `max.poll.interval.ms`. Lowering it is the usual first fix when slow processing triggers rebalances.
 
-It converts silent data corruption into a loud, blocking failure. That's the right trade when the cost of being wrong exceeds the cost of being down — the same reasoning behind `min.insync.replicas` rejecting writes in Lesson 06.
+Spring can hand you a `List` of records instead, by enabling batch listening, but that is a different container mode and not what you have configured.
 
 </details>
 
@@ -406,8 +444,10 @@ It converts silent data corruption into a loud, blocking failure. That's the rig
 
 ## Recap
 
-`@KafkaListener` registers your method with a listener container that runs the poll loop for you. `groupId` decides which offsets you own and who you share partitions with. `auto-offset-reset` decides where you start *only when you have no committed offset*. And your method runs on the polling thread, so slow processing triggers rebalances rather than merely adding lag.
+`@KafkaListener` registers your method with a listener container that runs the poll loop for you, and you inherit that loop's constraints: one thread per consumer, a bounded number of records per poll, and a deadline for returning to `poll()`.
 
-Right now you're logging the length of a JSON string. Time to read what's inside it.
+`groupId` decides which offsets you own and who you share partitions with, and changing it silently changes where you start. `auto-offset-reset` matters only on the first run of a group, or after retention has deleted the record you were pointing at.
 
-**Next:** [Lesson 16 — DTO records & deserialization →](16-dtos-and-deserialization.md)
+Your consumer currently logs the length of a JSON string. Next it learns what the JSON means.
+
+**Next:** [Lesson 16: DTO Records and Deserialization](16-dtos-and-deserialization.md)

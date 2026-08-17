@@ -1,460 +1,432 @@
-# Lesson 27 — Ops Toolbox & Production Checklist
+# Lesson 27: Ops Toolbox and Production Checklist
 
-> **Part 5 — Production** · 25 minutes
+> **Part 5: Production**
 
 ---
 
 ## What you'll learn
 
-- The CLI commands worth memorising, and what each one tells you
-- How to replay, skip, and rebalance in a real incident
-- Why graceful shutdown is a correctness concern, not a tidiness one
-- What separates this demo from a cluster you'd trust with money
+- The CLI commands worth knowing by heart when something is wrong
+- How to diagnose the four failures this course has caused on purpose
+- Why a producer needs a shutdown hook, and what it protects
+- What separates the pipeline you built from one you would trust with money
 
 ---
 
 ## Why this matters
 
-Twenty-six lessons of building. This one is about the day something breaks and you have a terminal, a paging alert, and no idea which of your assumptions is wrong.
+Every lesson so far introduced a mechanism. This one is about the fifteen minutes after something breaks, when nobody cares how partitions are assigned and everyone wants to know which records are missing.
 
-Everything here is reachable from Kafka UI too. Learn the CLI anyway: it works over SSH into a locked-down bastion, it composes with `grep` and `jq`, and it doesn't lie to you about state by caching for thirty seconds.
+It is also an honest accounting. You have built a complete, working pipeline that is not production-ready, and the gap between those two things is worth naming precisely rather than gesturing at.
 
 ---
 
 ## Before you start
 
-[Lesson 26](26-observability.md). Cluster running.
+[Lesson 26](26-observability.md), with a running stack.
 
-A reminder from Lesson 03: inside a broker container, use the **internal** listener, or you'll get connection warnings for nodes 2 and 3.
+Every command below runs inside a container and uses the internal listener, for the reason Lesson 06 demonstrated with real warnings:
 
 ```bash
---bootstrap-server kafka-1:29092
+docker exec kafka-1 <command> --bootstrap-server kafka-1:29092 ...
 ```
 
 ---
 
-## The toolbox
+## The concept
 
-### Is the cluster actually a cluster?
+### The toolbox
+
+Six commands cover most of what you will need.
+
+**Cluster health.**
 
 ```bash
 docker exec kafka-1 kafka-metadata-quorum \
   --bootstrap-server kafka-1:29092 describe --status
 ```
 
-`LeaderId` is a real node, `CurrentVoters` lists three. If `LeaderId: -1`, the brokers can't see each other — a networking problem, not a Kafka one. Nothing else you try will work until this does.
+`LeaderId` of `-1` means no controller, which means metadata changes have stopped: no leader elections, no topic creation, no ISR updates.
 
-### What shape is this topic, and is it healthy?
-
-```bash
-docker exec kafka-1 kafka-topics \
-  --bootstrap-server kafka-1:29092 \
-  --describe --topic wikimedia-stream
-```
-
-Read `Isr` against `Replicas`. Equal means healthy. Shorter means a replica has fallen behind or died, and you're closer to `min.insync.replicas` rejecting writes (Lesson 06).
-
-The fast version, for a cluster with many topics:
+**Under-replicated partitions**, the single best one-line health check:
 
 ```bash
-# Any partition whose ISR is smaller than its replica set
 docker exec kafka-1 kafka-topics \
   --bootstrap-server kafka-1:29092 --describe --under-replicated-partitions
+```
 
-# Partitions with no leader at all — writes and reads are both failing
+Empty output is good. Anything listed means a replica has fallen out of an ISR, so your durability margin has shrunk and you may be close to refusing writes.
+
+```bash
 docker exec kafka-1 kafka-topics \
   --bootstrap-server kafka-1:29092 --describe --unavailable-partitions
 ```
 
-Empty output from both is what you want. `--under-replicated-partitions` is the single best one-line health check for a Kafka cluster.
+Anything listed here has no leader at all, and is neither readable nor writable.
 
-### Who is consuming, and how far behind?
+**Consumer group state.**
 
 ```bash
 docker exec kafka-1 kafka-consumer-groups \
-  --bootstrap-server kafka-1:29092 \
-  --describe --group wikimedia-consumer-group
+  --bootstrap-server kafka-1:29092 --describe --group wikimedia-consumer-group
 ```
 
-The columns, and what each one means when it's wrong:
+Read three things: per-partition `LAG`, whether members are present, and whether one partition is behind while the others are fine. That last pattern is a poison pill or a hot partition, and it is invisible in aggregate lag.
 
-- **`LAG`** growing → consumers slower than producers
-- **`CONSUMER-ID` is `-`** → nobody is assigned; the group has no members
-- **one partition's lag growing, others flat** → a poison pill or a hot key (Lessons 04, 20)
-- **`CURRENT-OFFSET` frozen** → the consumer is stuck, not slow
-
-```bash
-# Every group on the cluster
-docker exec kafka-1 kafka-consumer-groups --bootstrap-server kafka-1:29092 --list
-```
-
-### How much data is in a partition?
-
-```bash
-docker exec kafka-1 kafka-get-offsets \
-  --bootstrap-server kafka-1:29092 --topic wikimedia-stream
-```
-
-```
-wikimedia-stream:0:978
-```
-
-`topic:partition:end-offset`. Add `--time -2` for the *start* offset. `end − start` is how many records are currently retained — not `end`, which counts every record ever written (Lesson 03).
-
-### What's actually in the dead-letter topic?
-
-```bash
-docker exec kafka-1 kafka-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream.dlt \
-  --from-beginning --property print.headers=true
-```
-
-The numeric headers print as garbage — they're big-endian bytes, not strings (Lesson 22). For anything beyond "is it empty," read them from the DLT consumer's logs.
-
-### Read one specific record
-
-The DLT headers gave you `originalPartition` and `originalOffset`. Use them:
-
-```bash
-docker exec kafka-1 kafka-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream \
-  --partition 1 --offset 8423 --max-messages 1
-```
-
-This is the single most useful debugging command in Kafka, and almost nobody knows `--partition` and `--offset` exist.
-
-### Change a topic config without a restart
+**Topic configuration**, when you want to know what a topic actually has rather than what your code says:
 
 ```bash
 docker exec kafka-1 kafka-configs \
-  --bootstrap-server kafka-1:29092 \
-  --alter --entity-type topics --entity-name wikimedia-stream \
-  --add-config retention.ms=86400000
+  --bootstrap-server kafka-1:29092 --entity-type topics \
+  --entity-name wikimedia-stream --describe --all
 ```
 
-Recall from Lesson 09 that `NewTopic` beans **do not** update an existing topic's config. This command is how retention, `min.insync.replicas`, and compression actually get changed on a live topic. Read them back with `--describe`.
+Read the `synonyms` field. Lesson 06 used this to discover a Compose setting that a dynamic default was silently overriding.
 
----
-
-## Incident recipes
-
-### Replay from a point in time
-
-*"The bad deploy went out at 09:15. Reprocess everything since."*
-
-Stop the consumer first — Kafka refuses to move offsets under a live group.
+**Where a topic's records are.**
 
 ```bash
-# 1. Dry run. No --execute means it only prints what it would do.
-docker exec kafka-1 kafka-consumer-groups \
-  --bootstrap-server kafka-1:29092 \
-  --group wikimedia-consumer-group --topic wikimedia-stream \
-  --reset-offsets --to-datetime 2026-07-10T09:15:00.000
-
-# 2. Do it.
-docker exec kafka-1 kafka-consumer-groups \
-  --bootstrap-server kafka-1:29092 \
-  --group wikimedia-consumer-group --topic wikimedia-stream \
-  --reset-offsets --to-datetime 2026-07-10T09:15:00.000 --execute
+docker exec kafka-1 kafka-get-offsets \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream --time -1
+docker exec kafka-1 kafka-get-offsets \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream --time -2
 ```
 
-Restart the consumer. It reprocesses from 09:15.
+`-1` is the end offset and `-2` is the start. The difference is how many records you can currently read, which is not the same as how many were ever written.
 
-**This only works if your processing is idempotent.** Reprocessing six hours of records against a non-idempotent consumer double-applies six hours of side effects. That's what the `(partition, offset)` unique constraint from Lesson 18 was for — and note it does *not* protect a replay from the DLT, which produces new offsets (Lesson 22).
-
-### Skip a poison pill
-
-*"One record is blocking a partition and I need throughput back now."*
-
-The blunt instrument:
-
-```bash
---reset-offsets --to-latest --execute
-```
-
-This skips **every** pending record on every partition, not just the bad one. You've traded one lost record for all of them.
-
-Better, if you know the offset:
-
-```bash
-docker exec kafka-1 kafka-consumer-groups \
-  --bootstrap-server kafka-1:29092 \
-  --group wikimedia-consumer-group \
-  --topic wikimedia-stream:1 \
-  --reset-offsets --to-offset 8424 --execute
-```
-
-`topic:partition` targets one partition. Move past offset 8423 and nothing else.
-
-Best: have a dead-letter topic, and never need this. That's Part 4.
-
-### Rebalance leadership after a broker restart
-
-Lesson 02's leaders-skew column goes bad after a restart: the recovered broker rejoins as a follower and never takes leadership back.
+**Preferred leader election**, for the skew Lesson 02 described:
 
 ```bash
 docker exec kafka-1 kafka-leader-election \
-  --bootstrap-server kafka-1:29092 \
-  --election-type preferred --all-topic-partitions
+  --bootstrap-server kafka-1:29092 --election-type preferred --all-topic-partitions
 ```
 
-Leadership returns to the **preferred leader** — the first broker listed in each partition's `Replicas`. Skew returns to near zero.
+After a broker restart its partitions stay led by whoever took over. This hands leadership back to the first entry in each `Replicas` list, evening out the load.
 
-### Add partitions (and understand what you just did)
+### Graceful shutdown
 
-```bash
-docker exec kafka-1 kafka-topics \
-  --bootstrap-server kafka-1:29092 \
-  --alter --topic wikimedia-stream --partitions 6
-```
+A producer holds unsent records in a buffer, as Lesson 12 established. Kill the process and that buffer is discarded, so records your application believed it had sent are gone.
 
-Instant, irreversible, and on a **keyed** topic it re-maps `murmur2(key) % partitionCount` for most keys. Existing records stay where they are; new records for the same key may go elsewhere. Per-key ordering breaks across the boundary (Lesson 04).
+Spring closes the context on `SIGTERM`, which flushes the `KafkaTemplate`. Two things defeat that: `SIGKILL`, which runs nothing, and a container orchestrator whose termination grace period is shorter than your flush.
 
-There is no `--partitions 3` to undo it.
-
----
-
-## Graceful shutdown
-
-The producer buffers records in memory (Lesson 12). Kill the JVM and everything in the accumulator is gone — records your application believed it had sent.
-
-`KafkaTemplate.flush()` blocks until every buffered record is acknowledged:
+An explicit hook makes the intent visible and gives you somewhere to log:
 
 ```java
-package com.javaguy.producer.producer;
+package com.example.wikimedia.producer.kafka;
 
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
 
 @Service
 public class WikimediaProducer {
 
-    // ... constructor, sendMessage ...
+    private static final Logger log = LoggerFactory.getLogger(WikimediaProducer.class);
+    private static final String TOPIC = "wikimedia-stream";
 
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
+    public WikimediaProducer(KafkaTemplate<String, String> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public void sendMessage(String key, String message) {
+        kafkaTemplate.send(TOPIC, key, message)
+                .whenComplete((result, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to send key={}: {}", key, ex.getMessage());
+                        return;
+                    }
+                    var metadata = result.getRecordMetadata();
+                    log.debug("Sent topic={} partition={} offset={}",
+                            metadata.topic(), metadata.partition(), metadata.offset());
+                });
+    }
+
+    /**
+     * Blocks until every buffered record has been acknowledged. Without this,
+     * a shutdown discards whatever linger.ms was still waiting to batch.
+     */
     @PreDestroy
-    public void drainOnShutdown() {
+    public void flushOnShutdown() {
         log.info("Flushing producer buffer before shutdown");
         kafkaTemplate.flush();
     }
 }
 ```
 
-Pair it with Spring Boot's graceful shutdown, so in-flight HTTP requests finish before the context closes:
-
-```yaml
-server:
-  shutdown: graceful
-spring:
-  lifecycle:
-    timeout-per-shutdown-phase: 30s
-```
-
-On the consumer side, Spring stops the listener containers before closing the context, so an in-flight `@KafkaListener` invocation completes and its `acknowledge()` runs. That's why `SIGTERM` is safe and `kill -9` is not: the latter loses the offset commit for work you already did, and you reprocess on restart.
-
-Kubernetes sends `SIGTERM`, waits `terminationGracePeriodSeconds`, then `SIGKILL`. Make sure that grace period exceeds your longest listener invocation.
+On the consumer side the equivalent concern is that a shutdown mid-record leaves the offset uncommitted, so the record is redelivered. That is not a problem, because Lesson 18 made processing idempotent. It is the reason that lesson mattered.
 
 ---
 
-## The production checklist
+## Hands-on
 
-What separates this repository from a cluster you'd trust with money.
+### Recipe 1: lag is climbing
 
-### Security — none of this project has any
+Confirm it is real, and find whether it is one partition or all of them:
 
-- [ ] **TLS everywhere.** Replace the `PLAINTEXT` listeners with `SSL` or `SASL_SSL`. Every byte in this project — including your data — currently crosses the network in the clear.
-- [ ] **Authentication.** SASL/SCRAM-SHA-512 or mTLS, for both client-to-broker and broker-to-broker. Right now any process that can reach port 9092 is a fully privileged client.
-- [ ] **Authorization.** Kafka ACLs (`kafka-acls`) restricting which principals may produce to or consume from which topics. Without them, your consumer can delete your topics.
-- [ ] **Secret management.** No passwords in `application.yml`. Environment variables at minimum; Kubernetes Secrets or Vault properly. This project has `password: password` committed to git.
+```bash
+docker exec kafka-1 kafka-consumer-groups \
+  --bootstrap-server kafka-1:29092 --describe --group wikimedia-consumer-group
+```
 
-### Cluster
+**All partitions climbing, members present.** Consumers are slower than producers. Check whether concurrency matches the partition count, and remember the partition count is the ceiling.
 
-- [ ] **Dedicated controller nodes.** Above ~5,000 partitions, split `KAFKA_PROCESS_ROLES` so controllers aren't competing with data I/O for disk and page cache (Lesson 07).
-- [ ] **JVM heap around 6 GB.** Kafka's performance comes from the OS page cache, not the heap. A large heap steals memory from the cache and lengthens GC pauses. `-Xms6g -Xmx6g`.
-- [ ] **Fast, dedicated disks.** Kafka is I/O bound. NVMe for `KAFKA_LOG_DIRS`, separate from the OS disk.
-- [ ] **`auto.create.topics.enable=false`.** Otherwise a typo in a topic name creates a topic instead of failing (Lesson 08).
-- [ ] **Pin every image tag.** `grafana/tempo:latest` is how Bug 3 in Lesson 26 happened.
+**All partitions climbing, no members.** The consumer is down. Lag was the wrong alert on its own, which is why Lesson 05's second quiz question exists.
 
-### Topics
+**One partition climbing.** Either a poison pill, if the offset is frozen, or a hot partition, if it is advancing slowly. Lesson 20 showed the first and Lesson 11 the second.
 
-- [ ] **RF 3, `min.insync.replicas` 2, `acks=all`.** Any two of these without the third gives you a comfortable illusion (Lesson 06).
-- [ ] **Partition count decided deliberately.** It only goes up, and raising it re-maps every key.
-- [ ] **Retention sized by replay need, not disk.** `retention.bytes` is per partition, and it's an OR with `retention.ms` — whichever trips first wins (Lesson 09).
-- [ ] **DLT retention longer than the source, with no size cap.** Failed records wait for a human (Lesson 21).
+### Recipe 2: writes are being refused
 
-### Producers
+```bash
+docker exec kafka-1 kafka-topics \
+  --bootstrap-server kafka-1:29092 --describe --under-replicated-partitions
+```
 
-- [ ] **`enable.idempotence=true`.** Default since Kafka 3.0. Set it explicitly so a conflicting config fails at startup instead of silently downgrading.
-- [ ] **Handle the `CompletableFuture`.** A lone `log.error` in the callback is silent data loss (Lesson 13).
-- [ ] **`linger.ms` > 0 if you enabled compression.** Otherwise you compress batches of one and conclude compression doesn't work (Lesson 12).
-- [ ] **`flush()` on shutdown.**
+If a partition appears with an ISR below `min.insync.replicas`, `acks=all` writes are being rejected with `NotEnoughReplicasException`. That is Kafka choosing to be unavailable rather than accept a write it cannot make durable.
 
-### Consumers
+Then check whether the cluster is otherwise healthy:
 
-- [ ] **`enable-auto-commit=false`, ack after the side effect.** Reversing those two lines converts a recoverable outage into permanent data loss (Lesson 18).
-- [ ] **Idempotent processing.** At-least-once is not optional; duplicate handling is how you survive it.
-- [ ] **A dead-letter topic**, with an error handler that classifies exceptions as retryable or not (Lessons 20–21).
-- [ ] **Processing faster than `max.poll.interval.ms`.** Slow listeners cause rebalance storms and duplicate work, and no amount of `session.timeout.ms` helps (Lesson 19).
-- [ ] **`CooperativeStickyAssignor`**, so a rolling restart doesn't stop the world for every member.
+```bash
+docker exec kafka-1 kafka-metadata-quorum \
+  --bootstrap-server kafka-1:29092 describe --status | grep LeaderId
+```
 
-### Schema
+A real node ID means one broker is missing. A `-1` means you have lost quorum as well, and you are looking at two failures at once.
 
-- [ ] **Schema Registry with `BACKWARD` compatibility**, and `auto.register.schemas=false` in production so schemas are registered by CI, not by whichever producer started first (Lesson 25).
-- [ ] **`ErrorHandlingDeserializer`** wrapping the Avro deserializer, or migrating to Avro silently disables your dead-letter path.
+### Recipe 3: the consumer is running and nothing is arriving
 
-### Observability
+The nastiest one, because every graph looks fine.
 
-- [x] **Metrics, traces, and logs** pushed via OTLP; `kafka-exporter` for lag.
-- [ ] **Alert on sustained lag growth**, not absolute lag — a replay legitimately produces enormous lag.
-- [ ] **Alert on consumer group member count = 0.** Lag cannot see this; a dead group has zero lag growth only because nothing is committing.
-- [ ] **Alert on the DLT's produce rate.** Dead-lettering *reduces* source lag. A pipeline can discard every record with every dashboard green (Lesson 21).
-- [ ] **Alert on under-replicated partitions.**
-- [ ] **Sample traces below 100%**, ideally tail-based so failures are always kept.
-- [ ] **Verify telemetry end-to-end.** All four bugs in Lesson 26 left the app healthy. "The container is up" is not evidence.
+```bash
+docker exec kafka-1 kafka-get-offsets \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt --time -1
+```
+
+If those offsets are climbing, the consumer is receiving records and rejecting all of them. Lag is zero because dead-lettering advances the offset, exactly as Lesson 21 and Lesson 22 established.
+
+Then read one:
+
+```bash
+docker exec kafka-1 kafka-console-consumer \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt \
+  --from-beginning --max-messages 1 \
+  --formatter-property print.headers=true
+```
+
+And read `kafka_dlt-exception-cause-fqcn`, not `kafka_dlt-exception-fqcn`. The primary header holds Spring's `ListenerExecutionFailedException` on every record, so filtering on it tells you nothing.
+
+### Recipe 4: a consumer keeps rebalancing
+
+Look for `CommitFailedException` in your application logs. If it is there, a member is being evicted mid-processing and its partitions reassigned.
+
+The cause is processing slower than `max.poll.interval.ms`, not heartbeating. Raising `session.timeout.ms` will not help, for the reason Lesson 19 gave: heartbeats come from a separate thread and were never the problem.
+
+Fix it in this order: make processing faster, lower `max-poll-records` so one poll's workload is smaller, then raise `max.poll.interval.ms`.
+
+### Recipe 5: a schema deploy went out and nothing publishes
+
+Health checks are green and the producer cannot send. Look for `SerializationException` with an HTTP 409.
+
+```bash
+curl -s localhost:8085/subjects/wikimedia-stream-value/versions
+```
+
+Registration is lazy, inside `serialize()`, so an incompatible schema starts cleanly and fails on the first record. That is Lesson 25's point, and it is why a CI compatibility check is worth having.
 
 ---
 
 ## Try it yourself
 
-1. Run `--describe --under-replicated-partitions`, then `docker stop kafka-3`, and run it again. How long until the partitions appear? Which timeout governs that delay?
+1. Cause each of the five recipes deliberately, and time how long it takes you to diagnose each one using only the CLI. Which was hardest, and which metric would have told you fastest?
 
-2. Restart a broker, check leader skew in Kafka UI, then run a preferred-leader election. Quantify the before and after.
+2. Restart one broker, then check leader skew in Kafka UI. Run the preferred-leader election and check again. Quantify the difference.
 
-3. Add `@PreDestroy` with `flush()` to the producer. Send 10,000 records and `Ctrl-C` mid-stream. Compare the topic's end offset with and without the flush.
+3. Kill the producer with `SIGKILL` while the stream is running, with `linger.ms` at 20, then again with `SIGTERM`. Compare the end offsets before and after each. Does `@PreDestroy` run in both cases?
 
-4. Pick the three checklist items you'd do first for a service handling payments. Justify the order. (There's no single right answer, but "TLS before dedicated controller nodes" is defensible and the reverse is not.)
+4. Work through the checklist below against your own pipeline and write down which three items you would fix first if this were carrying real traffic. Defend the ordering.
+
+---
+
+## The production checklist
+
+What separates what you have built from something you would trust with money. Every unticked box is a real gap, and they are ordered roughly by how much damage each would do.
+
+### Security
+
+- [ ] **TLS between clients and brokers.** Everything you built crosses the network in the clear on `PLAINTEXT` listeners.
+- [ ] **Authentication**, with SASL or mTLS. Right now any process that can reach port 9092 is a fully privileged client.
+- [ ] **ACLs per topic and per consumer group.** No client should be able to read a topic it does not need, or create topics at all.
+- [ ] **Secrets outside source control.** The H2 password you set in Lesson 18 is in a committed file.
+- [ ] **The H2 console disabled.** Lesson 18 enabled it for convenience.
+
+### Durability
+
+- [x] **Replication factor 3 with `min.insync.replicas` of 2 and `acks=all`.** Lesson 09 and Lesson 10.
+- [x] **Idempotent producer.** Lesson 10.
+- [x] **Manual acknowledgment after the write.** Lesson 17 and Lesson 18.
+- [x] **Idempotent processing, keyed on the record's identity.** Lesson 18.
+- [ ] **`unclean.leader.election.enable=false` verified**, not assumed. It is the default; confirm it.
+- [ ] **Backups or tiered storage.** Retention is not a backup.
+
+### Schema and data
+
+- [x] **A schema registry with a compatibility rule.** Lesson 25.
+- [ ] **Compatibility checked in CI**, not discovered on the first `send()`.
+- [ ] **A retention policy that matches your replay requirement.** Lesson 09's fourth quiz question: `retention.bytes` and `retention.ms` are an OR.
+
+### Operations
+
+- [x] **Topics declared as code.** Lesson 09, with the caveat that it creates rather than converges.
+- [ ] **Topic configuration managed by something that converges**, since `NewTopic` ignores changes to an existing topic.
+- [x] **Auto topic creation disabled.** Lesson 09.
+- [x] **Cooperative rebalancing.** Lesson 19. Note this is close to the default already: since Kafka 3.0 the default strategy list negotiates cooperative when all members support it.
+- [x] **Graceful shutdown that flushes the producer.** This lesson.
+- [ ] **A runbook**, so the five recipes above are not carried in one person's head.
+
+### Observability
+
+- [x] **Metrics, traces and logs.** Lesson 26.
+- [x] **Alert on consumer lag.** Lesson 26.
+- [x] **Alert on the dead-letter rate**, because dead-lettering clears lag.
+- [ ] **Alert on under-replicated partitions.**
+- [ ] **Trace sampling set for your volume.** 1.0 is fine locally and ruinous at scale.
+
+### Testing
+
+- [x] **Integration tests against a real broker.** Lesson 24.
+- [x] **The dead-letter path covered by a test.** Lesson 24.
+- [ ] **A test against a real database rather than H2.**
+- [ ] **A load test that establishes your actual throughput ceiling.**
 
 ---
 
 ## Common mistakes
 
-**`--reset-offsets` without `--execute`.**
-A dry run. Read the `WARN`.
+**Using `localhost:9092` inside a container.**
+It reaches only that container's broker, and the metadata it returns points at addresses that do not resolve there.
 
-**`--reset-offsets` with the consumer running.**
-Kafka refuses. Stop the group.
+**Filtering a dead-letter topic on `kafka_dlt-exception-fqcn`.**
+Every record holds Spring's wrapper. Your exception is in the cause header.
 
-**`--to-latest` to skip one bad record.**
-Skips every pending record on every partition.
+**Alerting on lag alone.**
+A consumer rejecting every record reports zero lag.
 
-**Adding partitions to a keyed topic without thinking.**
-Instant, irreversible, and it re-maps your keys.
+**Raising `session.timeout.ms` to stop rebalances.**
+Wrong timeout. Slow processing trips `max.poll.interval.ms`.
 
-**`kill -9` on a consumer.**
-Loses the offset commit for work already done. Reprocessed on restart.
+**Treating retention as a backup.**
+It is a deletion policy with an OR in it.
 
-**Treating the checklist as done because the demo works.**
-This project has no TLS, no auth, no ACLs, and a password in git. It is a teaching artifact.
+**Assuming `SIGKILL` flushes anything.**
+It runs no shutdown hook. Buffered records are lost.
+
+**Trusting your code over the broker.**
+`kafka-configs --describe --all` is the truth. Lesson 06 found a setting that was being silently overridden.
 
 ---
 
 ## Check your understanding
 
-**1. `--under-replicated-partitions` returns empty, but writes are failing with `NotEnoughReplicasException`. How?**
+**1. Aggregate lag is flat and a downstream team says records are missing. Where do you look?**
 
 <details>
 <summary>Reveal answer</summary>
 
-They can't both be true at the same instant — but they can be seconds apart, and that's the point.
+Per-partition lag first, then the dead-letter topic.
 
-`NotEnoughReplicasException` means the ISR was below `min.insync.replicas` **when the write arrived**. `--under-replicated-partitions` reports the ISR **now**. A replica that briefly fell behind — a GC pause, a slow disk flush, a network blip — leaves the ISR, rejects the writes that arrive during that window, catches up, and rejoins.
+Aggregate lag hides two failures. A single partition frozen by a poison pill contributes a growing number to a sum that is otherwise small, and on a busy topic that can look like noise. And a consumer failing every record has zero lag by construction, because the recoverer advances the offset.
 
-By the time you run the command, everything is healthy. The producer's error is real and the cluster's health is real.
-
-This is why you alert on the *metric over time* (`kafka_under_replicated_partitions`) rather than running a command after the fact. Transient ISR shrinkage under load is one of the most common causes of intermittent produce failures, and it is invisible to point-in-time inspection.
+So: `--describe` the group and look for one partition behaving differently, then check whether the dead-letter topic's end offsets are climbing. If they are, the pipeline is working perfectly and rejecting everything.
 
 </details>
 
-**2. You reset a consumer group to `--to-datetime` six hours ago to replay a bad deploy. Your consumer writes to a database with a unique constraint on `(kafka_partition, kafka_offset)`. Is the replay safe?**
+**2. Why will raising `session.timeout.ms` not fix a rebalance storm caused by slow processing?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Yes, for this replay — and it's worth being precise about why.
+Because it governs heartbeats, and heartbeats were never late.
 
-Resetting offsets makes the consumer re-read the **same physical records**: same partition, same offset. Each `save()` therefore presents the same `(partition, offset)` pair as the original write, hits the unique constraint, and is rejected as a duplicate. The replay is idempotent.
+Heartbeats come from a background thread that keeps beating regardless of what your listener is doing, so a member spending six minutes on one record is heartbeating perfectly throughout. What evicted it is `max.poll.interval.ms`, which measures the gap between `poll()` calls.
 
-What is *not* safe is replaying from the **dead-letter topic**. That means producing the record's value back to the source topic, where it gets a **new offset** (and possibly a new partition). The constraint sees a fresh key and inserts a second row (Lesson 22).
-
-So the same idempotency key protects one kind of replay and not the other. Replay-safety across republication requires a key derived from the event's content or a producer-assigned ID — Wikimedia's `meta.id`, an order ID, a request ID.
+Raising the session timeout also has a cost: genuinely dead members now take that much longer to be detected, so real failures recover more slowly. You have made the wrong thing worse.
 
 </details>
 
-**3. Your team sets `min.insync.replicas=3` on an RF-3 topic "to be extra safe." What did they actually buy?**
+**3. You `SIGKILL` the producer with `linger.ms` at 20. What is lost?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Zero fault tolerance for writes, and no additional durability.
+Every record still in the accumulator, which under light load is up to 20 milliseconds' worth per partition.
 
-With `acks=all` and a healthy ISR of 3, the write already reaches all three replicas. Raising the floor to 3 doesn't make it *more* durable — it just forbids the write when the ISR is anything less.
+`SIGKILL` runs no shutdown hook, so `@PreDestroy` never fires, the context never closes and nothing flushes. Any record whose batch had not yet been sent is discarded from memory.
 
-So now: any single broker restarting — a rolling deploy, a kernel patch, a spot-instance reclaim — drops the ISR to 2, which is below the floor, and every `acks=all` write is rejected until it rejoins and catches up. A routine deploy becomes a write outage.
+The application had already returned from `send()` for those records, so nothing in your code sees a failure. Lesson 13's callback fires only for records that got as far as a broker response, and these never did.
 
-`min.insync.replicas = RF − 1` is the largest floor that still tolerates one failure. With RF 3, that's 2 (Lesson 06).
+This is also why `acks` cannot help. `acks` is a promise about what the broker does once a record arrives, and these records never left the process.
 
 </details>
 
-**4. Why is `kill -9` on a consumer a correctness problem rather than an availability one?**
+**4. `MANUAL_IMMEDIATE` commits after each record. You `SIGKILL` the consumer immediately after a database write. Is the record reprocessed?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because it can destroy an offset commit for work that already happened.
+It depends on whether `acknowledge()` had returned, and the answer is more favourable than people expect.
 
-The listener processes a record, writes to the database, and calls `acknowledge()`. With `MANUAL_IMMEDIATE` the commit is issued but is asynchronous — it's in flight. `SIGKILL` terminates the process before the broker records it.
+`MANUAL_IMMEDIATE` uses `commitSync`, because Spring's `syncCommits` defaults to true. So `acknowledge()` blocks until the broker confirms the offset. If it returned before the kill, the offset is genuinely stored and the record is not redelivered.
 
-On restart, the group resumes from the last *durably committed* offset, which is before that record. It's redelivered, reprocessed, and the database write happens twice. Without an idempotency key, you have double-applied a side effect.
+If the kill landed between the database write and the commit returning, the record is redelivered and written again, which Lesson 18's unique constraint absorbs.
 
-`SIGTERM` gives Spring the chance to stop the listener containers, let in-flight invocations finish, and flush pending commits before the context closes. The offset then reflects the work actually done.
-
-The same argument applies to the producer, in the other direction: `kill -9` discards the record accumulator, losing records `send()` accepted.
+The window is real but small, and it is synchronous rather than fire-and-forget. Descriptions of `MANUAL_IMMEDIATE` as an async commit have the mechanism backwards, and the practical consequence is that this mode costs a round trip per record.
 
 </details>
 
-**5. Every dashboard is green. Lag is zero. Consumer group has three healthy members. Records are not reaching your database. Name two causes consistent with all of that.**
+**5. A schema deploy leaves the producer healthy and unable to publish. Why did no health check catch it?**
 
 <details>
 <summary>Reveal answer</summary>
 
-**Dead-lettering.** Every record fails, exhausts its retries, and is published to `wikimedia-stream.dlt`. The offset is committed — from the source topic's perspective this is success — so lag stays at zero and members stay healthy. Records land in a topic nobody consumes, and vanish in 30 days (Lesson 21).
+Because `KafkaAvroSerializer` registers the schema lazily, inside `serialize()`, on the first record it handles.
 
-**A `groupId` collision.** A second application deployed with the same `group.id` joined the group and took some partitions. Each app now processes a subset of records. Both look healthy, lag is zero across the group, and your database is missing roughly half the events. Nothing errors (Lesson 15).
+Nothing contacts the registry during startup, so context initialisation, health endpoints and readiness probes all pass. The failure arrives with the first record as a `SerializationException` wrapping an HTTP 409, at which point the deploy has been declared successful.
 
-A third: the consumer acknowledges *before* the database write, so `save()` failures are logged and skipped while offsets advance (Lesson 18).
+Setting `auto.register.schemas` to false changes who may register, not when the lookup happens, so it does not move the failure earlier either.
 
-All three share a shape — **the pipeline is successfully processing records into nowhere.** Lag measures whether you're keeping up, not whether you're doing the right thing. That's why you also alert on DLT produce rate, member count, and a business-level metric such as rows written per minute.
+Catching this at deploy time requires checking compatibility yourself, either in CI against the registry's compatibility endpoint or in a startup bean that fails the context. That is the unticked checklist item under Schema and data.
 
 </details>
 
 ---
 
-## You're done
+## Recap
 
-Twenty-eight lessons ago you didn't have a topic. Now you have:
+Six CLI commands cover most incidents: quorum status, under-replicated and unavailable partitions, consumer group state, effective topic configuration, offsets, and preferred-leader election.
 
-- a 3-broker KRaft cluster you can inspect, break, and heal
-- a producer that batches, compresses, keys, and never silently drops a record
-- a consumer that persists before it commits, so an outage becomes lag rather than loss
-- retries that back off, a classification that doesn't waste them, and a dead-letter topic that catches what's left
-- integration tests against a real broker, covering the failure path as well as the happy one
-- a schema contract that rejects breaking changes at the producer's startup
-- three telemetry signals, and the knowledge that a green dashboard proves nothing until you've sent a probe through it
+The five recipes map symptoms to causes, and three of them exist because a metric you would naturally trust is structurally unable to see the problem: aggregate lag hides a single stuck partition, zero lag hides a consumer rejecting everything, and a green health check hides a lazy schema registration.
 
-More usefully, you can reason about the failures. You know why a keyless producer costs you ordering forever, why `acks=all` alone is not durability, why a slow listener causes duplicate work rather than merely lag, and why a dead-letter topic makes an incident quieter rather than louder.
+A producer needs an explicit flush on shutdown, because buffered records are invisible to `acks` and to your callbacks.
 
 ---
+
+## End of Part 5
+
+You started with one broker and no code. You now have a pipeline that streams live events from a public feed, keys them so that related records stay ordered, publishes them durably to a replicated topic, consumes them on three threads, persists them idempotently, retries transient failures with backoff, parks permanent ones with their payload and diagnosis intact, serves them over an HTTP API, verifies itself against a real broker in tests, versions its payload with a schema registry, and reports all three observability signals.
+
+More importantly, you can explain why each of those decisions was made, and what breaks without it.
 
 ## Where to go next
 
-**Kafka Streams** — stateful stream processing: joins, windows, aggregations, with state stores backed by changelog topics. The natural sequel to `@KafkaListener`.
+Three directions, in increasing distance from what you have built.
 
-**Kafka Connect** — moving data in and out of Kafka without writing consumers. Debezium's CDC connector, in particular, turns your database's write-ahead log into a topic.
+**Harden this.** Work down the checklist. TLS, SASL and ACLs are the largest single gap, and they change every client's configuration.
 
-**Transactions and exactly-once** — `read_committed` (Lesson 17) exists for this. Worth understanding, worth avoiding until at-least-once plus idempotency genuinely isn't enough.
+**Kafka Streams.** Everything here treated Kafka as transport. Streams treats it as a database you can join, aggregate and window, with state stores backed by compacted topics. The mental model you built in Lesson 01 is the prerequisite.
 
-**Tiered storage** — offloading old segments to object storage, decoupling retention from broker disk. It changes the "retention is expensive" calculus that shaped several decisions in this course.
+**Kafka Connect.** Most pipelines that move data between Kafka and something else do not need an application at all. Connect is the framework for that, and knowing when not to write a consumer is worth as much as knowing how.
 
----
-
-Back to the **[course index](README.md)**, or the [main README](../README.md) for the reference implementation.
+Back to the **[course index](README.md)**.

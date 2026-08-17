@@ -1,31 +1,29 @@
-# Lesson 22 — DLT Headers & Replay
+# Lesson 22: DLT Headers and Replay
 
-> **Part 4 — Resilience** · 30 minutes
+> **Part 4: Resilience**
 
 ---
 
 ## What you'll learn
 
-- What Kafka headers are, and why they're `byte[]` rather than strings
-- How to decode the seven `kafka_dlt-*` headers, including the big-endian numeric ones
-- Why a DLT consumer must never simply re-throw
-- How to actually replay a dead-lettered record once you've fixed the bug
+- Why a Kafka header is bytes rather than a string, and how to decode each one correctly
+- Which exception header actually holds your exception
+- Which headers accumulate across repeated failures and which are replaced
+- Why a dead-letter consumer must never throw, and why replay is harder than it looks
 
 ---
 
 ## Why this matters
 
-Lesson 21 ended with records accumulating on `wikimedia-stream.dlt` and nobody watching. A dead-letter topic that nobody consumes is a 30-day countdown to data loss with extra steps.
+Lesson 21 parked a failed record with seven headers attached. Right now they are unreadable: two of them print as garbage and one of them holds a different exception than you would expect.
 
-Closing the loop needs three things: something that *notices* a record arrived, something that makes the failure *legible*, and a way to *replay* it once the bug is fixed. All three depend on reading headers — the metadata Spring attached on the way out, which is the only record of where the failure came from and why.
+Reading them correctly is the difference between a dead-letter topic that supports an investigation and one that merely proves failures happened.
 
 ---
 
 ## Before you start
 
-[Lesson 21](21-dead-letter-topics.md). A working DLT with at least one record on it.
-
-If it's empty, put something there:
+[Lesson 21](21-dead-letter-topics.md), with at least one record on `wikimedia-stream.dlt`. Produce another if you need one:
 
 ```bash
 echo 'this is not json' | docker exec -i kafka-1 kafka-console-producer \
@@ -38,110 +36,126 @@ echo 'this is not json' | docker exec -i kafka-1 kafka-console-producer \
 
 ### Headers are bytes
 
-A Kafka record is a key, a value, a timestamp, and **headers**: an ordered list of `(String name, byte[] value)` pairs.
+A Kafka record is a key, a value, a timestamp and **headers**: an ordered list of name and `byte[]` pairs.
 
-Not `Map<String, String>`. Three consequences:
+Not a `Map<String, String>`. Three consequences follow.
 
-**Values are raw bytes.** Kafka does not know or care what's in them. A header holding the number `42` might be the four bytes `00 00 00 2A`, or the two ASCII characters `4` and `2`. You must know which.
+**Values are raw bytes.** Kafka neither knows nor cares what is in them. A header holding the number 42 might be the four bytes `00 00 00 2A`, or the two ASCII characters `4` and `2`. You have to know which.
 
-**Names can repeat.** Headers are a list, not a map. `record.headers().lastHeader(name)` gets the most recent — which matters, because a record that fails, is dead-lettered, is replayed, and fails *again* accumulates a second set of `kafka_dlt-*` headers. The last one is the most recent failure.
+**Names can repeat.** Headers are a list, so `lastHeader(name)` returns the most recent occurrence.
 
-**They travel with the record.** Headers are the standard place for cross-cutting metadata — trace IDs, schema versions, tenant IDs — that doesn't belong in your payload schema.
+**They travel with the record.** Headers are the standard place for cross-cutting metadata such as trace identifiers, schema versions and tenant identifiers, which do not belong in your payload schema. Lesson 26 relies on exactly that.
 
-### The seven headers, and their types
-
-`DeadLetterPublishingRecoverer` attaches these. Note the type column: it is the entire difficulty of this lesson.
+### The seven headers and their types
 
 | Header | Type | Decode with |
 |---|---|---|
 | `kafka_dlt-original-topic` | UTF-8 string | `new String(bytes, UTF_8)` |
-| `kafka_dlt-original-partition` | **4-byte big-endian int** | `ByteBuffer.wrap(bytes).getInt()` |
-| `kafka_dlt-original-offset` | **8-byte big-endian long** | `ByteBuffer.wrap(bytes).getLong()` |
-| `kafka_dlt-original-timestamp` | **8-byte big-endian long** | `ByteBuffer.wrap(bytes).getLong()` |
+| `kafka_dlt-original-partition` | 4-byte big-endian int | `ByteBuffer.wrap(bytes).getInt()` |
+| `kafka_dlt-original-offset` | 8-byte big-endian long | `ByteBuffer.wrap(bytes).getLong()` |
+| `kafka_dlt-original-timestamp` | 8-byte big-endian long | `ByteBuffer.wrap(bytes).getLong()` |
 | `kafka_dlt-exception-fqcn` | UTF-8 string | `new String(bytes, UTF_8)` |
 | `kafka_dlt-exception-message` | UTF-8 string | `new String(bytes, UTF_8)` |
 | `kafka_dlt-exception-cause-fqcn` | UTF-8 string | `new String(bytes, UTF_8)` |
 
-Decode `kafka_dlt-original-partition` with `new String(...)` and you don't get `"1"`. You get the four bytes `00 00 00 01` interpreted as UTF-8 — three null characters and a `SOH` control character. It prints as garbage or as nothing at all, and it doesn't throw.
+Decode `kafka_dlt-original-partition` with `new String(...)` and you do not get `"1"`. You get four bytes, `00 00 00 01`, interpreted as UTF-8: three null characters and a control character. It prints as nothing or as garbage, and it does not throw.
 
-That silent-wrong-answer property is why this lesson exists. Java's `ByteBuffer` defaults to big-endian, which matches Kafka's wire format, so `ByteBuffer.wrap(h.value()).getInt()` is correct with no configuration.
+That silent wrong answer is why this lesson exists. Java's `ByteBuffer` is big-endian by default, which matches Kafka's wire format, so `ByteBuffer.wrap(header.value()).getInt()` is correct with no configuration.
+
+### Your exception is in the cause header
+
+Lesson 21 flagged this and it is worth repeating, because it is the most common mistake made against a dead-letter topic.
+
+When a `@KafkaListener` method throws, Spring wraps the exception in a `ListenerExecutionFailedException` before the error handler sees it. The recoverer records that wrapper in `kafka_dlt-exception-fqcn`, and your own exception in `kafka_dlt-exception-cause-fqcn`.
+
+So a dashboard grouping failures by `kafka_dlt-exception-fqcn` shows one bucket containing everything, and a query filtering it for `IllegalArgumentException` returns nothing at all. The empty result looks like an absence of failures.
+
+Read the cause header. That is where the information is.
+
+### Which headers accumulate, and which do not
+
+Here is a genuine subtlety that is widely misreported.
+
+A record can fail, be dead-lettered, be replayed, and fail again. Headers are a list, so you might reasonably expect two full sets of `kafka_dlt-*` headers to build up. That is half right.
+
+`DeadLetterPublishingRecoverer` treats the two families differently:
+
+- **`original-*` headers append.** Each trip adds another set, so the list preserves the chain of origins.
+- **`exception-*` headers are replaced.** The recoverer strips the previous ones before adding the new set, because `stripPreviousExceptionHeaders` defaults to true.
+
+So after three failures you have three `original-offset` headers and exactly one `exception-fqcn`, describing the most recent failure only. If you want the full exception history, you have to ask for it with `setStripPreviousExceptionHeaders(false)`.
+
+The reasoning is defensible: exception messages and stack traces are large, and an unbounded accumulation of them on a record that keeps failing would grow without limit. It is still surprising, and using `lastHeader()` on an exception header is not wrong so much as it is reading the only value there is.
 
 ### The value is untouched
 
-The DLT record's key and value are **the original bytes**. `DeadLetterPublishingRecoverer` republishes them verbatim.
+The dead-letter record's key and value are the original bytes, republished verbatim. That is what makes replay possible at all: the payload is byte-identical to the one that failed, so you can fix the consumer, read the record back, and produce it to the source topic unchanged.
 
-That's what makes replay possible: the payload on the DLT is byte-identical to the payload that failed. You can fix your consumer, read the record back off the DLT, and produce it to the source topic unchanged.
-
-### A DLT consumer must not throw
+### A dead-letter consumer must not throw
 
 This is the trap.
 
-Your DLT listener has an error handler too — the same `DefaultErrorHandler` bean, since it's on the same container factory. If the DLT listener throws, the recoverer publishes the record to `wikimedia-stream.dlt.dlt`.
+Your dead-letter listener uses the same container factory, so it has the same error handler and the same recoverer. If it throws, the recoverer publishes the record to `wikimedia-stream.dlt.dlt`. If that fails, `.dlt.dlt.dlt`, and a topic list nobody wants to explain.
 
-If *that* fails, you get `.dlt.dlt.dlt`. And a topic list nobody wants to explain.
+So a dead-letter consumer's job is narrow and must be reliable:
 
-So a DLT consumer's job is narrow and it must be reliable:
-
-1. **Record** the failure — persist it, or at minimum log it with full context.
-2. **Alert** — increment a metric someone is paged on.
-3. **Acknowledge** — always. The record is already parked; failing to ack means redelivering it forever.
+1. **Record** the failure, by persisting it or at minimum logging it with full context.
+2. **Alert**, by incrementing a metric someone is paged on.
+3. **Acknowledge**, always. The record is already parked, and failing to acknowledge means redelivering it forever.
 
 It must not do the thing that failed. It must not call the database that was down. It should do as close to nothing as possible.
 
 ### Replay, honestly
 
-Replaying means producing the DLT record's value back to the source topic. There is no Kafka feature for this; you write it.
+Replaying means producing the dead-letter record's value back to the source topic. There is no Kafka feature for this. You write it.
 
-The shape:
-
+```mermaid
+flowchart LR
+    D["wikimedia-stream.dlt"] --> C["read record"]
+    C --> F{"is the fix<br/>deployed?"}
+    F -->|"no"| X["stop, it will fail again"]
+    F -->|"yes"| P["produce value to<br/>wikimedia-stream"]
+    P --> M["main consumer<br/>processes as new"]
 ```
-read from wikimedia-stream.dlt
-  → check the fix is deployed
-  → produce value to wikimedia-stream
-  → the main consumer processes it normally
-```
 
-Three things that make this harder than it sounds.
+Three things make it harder than it sounds.
 
-**Replaying a poison pill loops.** If you replay a malformed record without fixing the parser, it fails again and returns to the DLT. Now you have two copies. Replay is only safe *after* the fix.
+**Replaying a poison pill loops.** Replay a malformed record without fixing the parser and it fails again, returns to the dead-letter topic, and now you have two copies. Replay is only safe after the fix.
 
-**Replay is a new record.** It gets a new offset and a new timestamp on the source topic. Your idempotency key from Lesson 18 — `(partition, offset)` — will not match the original, so the record will be processed as new. If the original partially succeeded, you may double-apply. Idempotency on a *business* key is what saves you here.
+**A replayed record is a new record.** It gets a new offset and a new timestamp on the source topic, so the idempotency key from Lesson 18, partition and offset, will not match the original. The record is processed as new. If the original partially succeeded, you may double-apply, and only idempotency on a business key would save you.
 
-**Order is not preserved across a replay.** The replayed record arrives at the end of the log, long after the records that originally followed it. If those depended on its effects, you have applied them in the wrong order and no amount of same-partition routing helps.
+**Order is not preserved across a replay.** The replayed record arrives at the end of the log, long after the records that originally followed it. If those depended on its effects, you have applied them in the wrong order, and no amount of same-partition routing helps.
 
-Replay is a repair tool, not a routine mechanism. Preventing the failure is better.
+Replay is a repair tool rather than a routine mechanism. Preventing the failure is better, which is why Lesson 20 spent so long on classifying exceptions.
 
 ---
 
 ## Hands-on
 
-### 1. Inspect the DLT from the CLI first
-
-Before writing Java, look at what's actually there:
+### 1. Look at the raw headers first
 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server kafka-1:29092 \
   --topic wikimedia-stream.dlt \
   --from-beginning --max-messages 1 \
-  --property print.headers=true \
-  --property print.partition=true
+  --formatter-property print.headers=true \
+  --formatter-property print.partition=true
 ```
 
-```
-Partition:1	kafka_dlt-original-topic:wikimedia-stream,kafka_dlt-original-partition:...,
-kafka_dlt-exception-fqcn:java.lang.IllegalArgumentException,...	this is not json
-```
+The string headers are readable. `kafka_dlt-original-partition` and the two timestamp-shaped headers are visibly mangled, because the console consumer prints raw bytes as text and has no idea they are numbers.
 
-The string headers are readable. `kafka_dlt-original-partition` is visibly mangled — that's the four raw bytes being printed as text. The console consumer has no idea it's an `int`.
+Note also that `kafka_dlt-exception-fqcn` says `ListenerExecutionFailedException` rather than your exception.
 
-### 2. Write the DLT consumer
+### 2. Write the dead-letter consumer
 
-`consumer/WikimediaDltConsumer.java`:
+`src/main/java/com/example/wikimedia/consumer/kafka/WikimediaDltConsumer.java`:
 
 ```java
-package com.javaguy.consumer.consumer;
+package com.example.wikimedia.consumer.kafka;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.common.header.Header;
 import org.slf4j.Logger;
@@ -150,16 +164,11 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
 
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-
 /**
- * Every record here was published by DeadLetterPublishingRecoverer after the main
- * consumer exhausted its retries.
- *
- * In production this method would: persist the failed record to a dead-letter store,
- * increment a metric that pages someone, and expose an endpoint to replay or discard.
- * It must never throw — a failure here routes the record to wikimedia-stream.dlt.dlt.
+ * Reads parked failures and does as little as possible. This listener shares the
+ * error handler with the main consumer, so anything it throws would be published
+ * to wikimedia-stream.dlt.dlt. It therefore catches everything and always
+ * acknowledges.
  */
 @Service
 public class WikimediaDltConsumer {
@@ -171,285 +180,243 @@ public class WikimediaDltConsumer {
             groupId = "wikimedia-dlt-consumer-group"
     )
     public void consume(ConsumerRecord<String, String> record, Acknowledgment acknowledgment) {
-        log.error(
-                "[DLT] partition={} offset={} | originalTopic={} originalPartition={} "
-                        + "originalOffset={} | exception={} cause='{}' | value='{}'",
-                record.partition(),
-                record.offset(),
-                stringHeader(record, "kafka_dlt-original-topic"),
-                intHeader(record, "kafka_dlt-original-partition"),
-                longHeader(record, "kafka_dlt-original-offset"),
-                stringHeader(record, "kafka_dlt-exception-fqcn"),
-                stringHeader(record, "kafka_dlt-exception-message"),
-                record.value()
-        );
-
-        acknowledgment.acknowledge();
+        try {
+            log.error("""
+                            Dead-letter record
+                              origin        : {} partition={} offset={}
+                              failed with   : {}
+                              caused by     : {}
+                              message       : {}
+                              payload (200) : {}""",
+                    asString(record, "kafka_dlt-original-topic"),
+                    asInt(record, "kafka_dlt-original-partition"),
+                    asLong(record, "kafka_dlt-original-offset"),
+                    asString(record, "kafka_dlt-exception-fqcn"),
+                    asString(record, "kafka_dlt-exception-cause-fqcn"),
+                    asString(record, "kafka_dlt-exception-message"),
+                    truncate(record.value()));
+        } catch (Exception e) {
+            // Never propagate. A throw here would dead-letter the dead letter.
+            log.error("Failed to report dead-letter record at offset {}", record.offset(), e);
+        } finally {
+            acknowledgment.acknowledge();
+        }
     }
 
-    private String stringHeader(ConsumerRecord<?, ?> record, String key) {
-        Header header = record.headers().lastHeader(key);
-        return header == null ? "n/a" : new String(header.value(), StandardCharsets.UTF_8);
+    private String asString(ConsumerRecord<String, String> record, String name) {
+        Header header = record.headers().lastHeader(name);
+        return header == null ? "unknown" : new String(header.value(), StandardCharsets.UTF_8);
     }
 
-    // Kafka writes the partition as a 4-byte big-endian int. Reading it as a
-    // String yields control characters, silently.
-    private int intHeader(ConsumerRecord<?, ?> record, String key) {
-        Header header = record.headers().lastHeader(key);
+    private int asInt(ConsumerRecord<String, String> record, String name) {
+        Header header = record.headers().lastHeader(name);
         return header == null ? -1 : ByteBuffer.wrap(header.value()).getInt();
     }
 
-    // Offsets and timestamps are 8-byte big-endian longs.
-    private long longHeader(ConsumerRecord<?, ?> record, String key) {
-        Header header = record.headers().lastHeader(key);
+    private long asLong(ConsumerRecord<String, String> record, String name) {
+        Header header = record.headers().lastHeader(name);
         return header == null ? -1L : ByteBuffer.wrap(header.value()).getLong();
+    }
+
+    private String truncate(String value) {
+        if (value == null) {
+            return "null";
+        }
+        return value.length() <= 200 ? value : value.substring(0, 200) + "...";
     }
 }
 ```
 
-Note the **separate `groupId`**. `wikimedia-dlt-consumer-group` is not `wikimedia-consumer-group`. From Lesson 05: two listeners in the same group on different topics would still share partition assignments and offsets in confusing ways. Different concerns, different groups.
+Four decisions in there worth naming.
 
-Note also that every accessor returns a sentinel (`"n/a"`, `-1`) rather than throwing on a missing header. A DLT consumer that NPEs on an absent header has failed at the one job it has.
+**`acknowledge()` is in a `finally` block.** Whatever happens, the record is acknowledged. It is already parked, so redelivering it forever gains nothing.
 
-### 3. Run it
+**Everything is caught.** A header that is absent, a payload that is null, a decoding failure: none of them may escape.
 
-Restart the consumer. The DLT record is picked up immediately:
+**The cause header is logged alongside the primary one**, so the actual exception is visible rather than buried.
+
+**The payload is truncated.** A dead-letter record can be large, and a log line containing an entire failed payload at full length is its own problem.
+
+### 3. Run it and read the output
+
+Restart the consumer. It now has two listeners in two groups.
 
 ```
-ERROR [DLT] partition=1 offset=0 | originalTopic=wikimedia-stream originalPartition=1
-originalOffset=8423 | exception=java.lang.IllegalArgumentException
-cause='Unparseable Wikimedia event [partition=1 offset=8423]: Unrecognized token 'this''
-| value='this is not json'
+Dead-letter record
+  origin        : wikimedia-stream partition=1 offset=1043
+  failed with   : org.springframework.kafka.listener.ListenerExecutionFailedException
+  caused by     : java.lang.IllegalArgumentException
+  message       : Listener failed; Unparseable Wikimedia event [partition=1 offset=1043]
+  payload (200) : this is not json
 ```
 
-Every question you'd want answered, in one line:
+The partition and offset are now numbers rather than garbage, and both exception classes are visible.
 
-- **what** failed — `this is not json`
-- **where it came from** — `wikimedia-stream`, partition 1, offset 8423
-- **why** — `IllegalArgumentException`, with the parser's message
-- **where it's parked now** — DLT partition 1, offset 0
+Note the correspondence: `partition=1 offset=1043` from the headers matches the partition and offset that Lesson 16's parse method put into its own exception message. Two independent records of the same fact, which is exactly what you want when correlating a log line with a topic.
 
-`originalPartition=1` and the DLT's `partition=1` match. That's the same-partition routing from Lesson 21, verified.
+### 4. Prove the decoding matters
 
-### 4. Prove you can fetch the original record
-
-The headers point back at the source. Use them:
-
-```bash
-docker exec kafka-1 kafka-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream \
-  --partition 1 \
-  --offset 8423 \
-  --max-messages 1
-```
-
-Substitute the offset from your own log. Out comes the original record, still sitting in the source topic where it always was.
-
-**This is the payoff of the provenance headers.** Without `originalPartition` and `originalOffset`, you'd have a payload and no way to locate it in a topic holding millions of records.
-
-### 5. Watch a `.dlt.dlt` topic appear
-
-Make the DLT consumer throw:
+Temporarily change `asInt` to decode as a string:
 
 ```java
-    public void consume(ConsumerRecord<String, String> record, Acknowledgment acknowledgment) {
-        throw new IllegalStateException("DLT consumer is broken");
-    }
+        return header == null ? -1 : Integer.parseInt(
+                new String(header.value(), StandardCharsets.UTF_8));
 ```
 
-Restart, then list the topics:
+Restart and produce another poison pill. You get a `NumberFormatException`, caught by your own catch block, and the log line reports a reporting failure rather than the original one.
+
+That is the good case. Had the header happened to contain bytes that parsed, you would have got a plausible wrong number and never known. Put `ByteBuffer` back.
+
+### 5. Watch the header families diverge
+
+Produce a poison pill, let it be dead-lettered, then replay it manually so that it fails a second time:
 
 ```bash
-docker exec kafka-1 kafka-topics --bootstrap-server kafka-1:29092 --list
-```
-
-```
-wikimedia-stream
-wikimedia-stream.dlt
-wikimedia-stream.dlt.dlt
-```
-
-There it is. The error handler applied to the DLT listener too, `IllegalStateException` got the full backoff, and the recoverer routed it onward — appending `.dlt` to a topic name that already ended in `.dlt`.
-
-`wikimedia-stream.dlt.dlt` was auto-created with broker defaults: no `min.insync.replicas`, no 30-day retention, no size-cap removal. Every safety property you carefully configured is absent.
-
-Clean up:
-
-```bash
-docker exec kafka-1 kafka-topics --bootstrap-server kafka-1:29092 \
-  --delete --topic wikimedia-stream.dlt.dlt
-```
-
-Restore the working DLT consumer.
-
-### 6. Replay a record
-
-Fix your bug first — in this case, the "bug" is that `this is not json` was never valid, so there's nothing to fix. Simulate a real one: pretend the parser was broken and is now correct.
-
-Read the DLT record's value and produce it back:
-
-```bash
-# Read the parked payload
 docker exec kafka-1 kafka-console-consumer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream.dlt \
-  --from-beginning --max-messages 1 > /tmp/replay.txt
-
-# Produce it back to the source topic
-docker exec -i kafka-1 kafka-console-producer \
-  --bootstrap-server kafka-1:29092 \
-  --topic wikimedia-stream < /tmp/replay.txt
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt \
+  --from-beginning --max-messages 1 2>/dev/null \
+  | docker exec -i kafka-1 kafka-console-producer \
+    --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-Watch the consumer. Because the record is *still* unparseable, it fails, and returns to the DLT.
+Now count the headers on the second dead-letter record:
 
-**You now have two copies of it on the DLT**, with two sets of headers pointing at two different source offsets.
+```bash
+docker exec kafka-1 kafka-console-consumer \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt \
+  --from-beginning --formatter-property print.headers=true --max-messages 2 \
+  | tr ',' '\n' | grep -c 'kafka_dlt-original-offset'
+```
 
-That is the lesson. Replay without a fix multiplies the problem. Replay is a repair step that comes *after* a deploy, and a production replay endpoint should refuse to run unless someone asserts the fix is live.
+You will find more than one `original-offset` and exactly one `exception-fqcn`. The origins accumulated and the exception was replaced, because `stripPreviousExceptionHeaders` defaults to true.
+
+You have also just demonstrated the first replay hazard: replaying a poison pill without fixing anything produced a second copy of the same failure.
 
 ---
 
 ## Try it yourself
 
-1. Decode `kafka_dlt-original-partition` with `new String(header.value(), UTF_8)` instead of `ByteBuffer`. What prints? Does it throw? What does that tell you about how this bug would be discovered?
+1. Set `setStripPreviousExceptionHeaders(false)` on the recoverer and repeat step 5. How many exception headers now? Argue for the default, given what a stack-trace-sized header does to a record that fails repeatedly.
 
-2. Add a Micrometer counter to the DLT consumer, incremented on every record, and expose it via actuator. Then write the PromQL alert you'd page on. Should it alert on the total, or the rate?
+2. Write a replay endpoint on the consumer that reads a given dead-letter offset and produces its value back to `wikimedia-stream`. Then use it on a malformed record without fixing the parser, and describe what you have created.
 
-3. Replay a record that fails, twice. Then read the DLT record and call `record.headers().headers("kafka_dlt-exception-fqcn")` — plural, not `lastHeader`. How many are there? Which one is the current failure?
+3. Persist dead-letter records to a table instead of logging them, with columns for the decoded origin and both exception classes. Which of the three responsibilities from the concept section does that satisfy, and which still needs doing?
 
-4. Persist DLT records to a `dead_letter_events` table instead of logging them. What columns do you need to make replay possible without ever reading Kafka again? Is the value column enough?
+4. Add a Micrometer counter for dead-letter records, tagged by the *cause* class. Read it from `/actuator/metrics`. Why is that a better alert than lag, given Lesson 21's conclusion that lag now clears when a record fails?
 
 ---
 
 ## Common mistakes
 
-**Decoding `original-partition` or `original-offset` as a String.**
-Silently produces control characters. No exception, no log, just a wrong value in your diagnostics.
+**Decoding numeric headers as strings.**
+You get control characters rather than digits, and it does not throw.
 
-**Throwing from the DLT consumer.**
-Creates `<topic>.dlt.dlt`, auto-configured with broker defaults.
+**Reading `kafka_dlt-exception-fqcn` and reporting it as your exception.**
+It is Spring's wrapper. Yours is in the cause header.
 
-**Sharing a `groupId` between the main and DLT listeners.**
-Two topics, one group, confusing assignments.
+**Expecting exception headers to accumulate.**
+They are stripped and replaced by default. Only the `original-*` family appends.
 
-**Using `headers().lastHeader()` and assuming it's the only one.**
-A replayed-and-refailed record has several. `lastHeader` is correct — but know *why* it's correct.
+**Letting a dead-letter listener throw.**
+It shares the error handler, so it produces `.dlt.dlt`.
 
-**Throwing on a missing header.**
-`lastHeader()` returns `null` when absent. A DLT consumer that NPEs has failed at the one job it has.
+**Forgetting to acknowledge in the dead-letter listener.**
+The record is already parked, and not acknowledging redelivers it forever.
 
-**Replaying before deploying the fix.**
-The record fails again and returns to the DLT, duplicated.
+**Logging the whole payload.**
+Dead-letter payloads can be large, and unbounded log lines are their own incident.
 
-**Assuming a replayed record is idempotent because of `(partition, offset)`.**
-A replay gets a *new* offset. That key won't match. You need a business-level idempotency key.
+**Replaying before the fix is deployed.**
+The record fails again and you now have two copies of it.
 
-**Logging the DLT and calling it done.**
-Nothing alerts on a log line. Increment a metric.
+**Assuming a replayed record is deduplicated.**
+It arrives at a new offset, so the partition-and-offset idempotency key from Lesson 18 does not match.
 
 ---
 
 ## Check your understanding
 
-**1. Why is `kafka_dlt-original-partition` four bytes rather than the string `"1"`?**
+**1. `new String(header.value(), UTF_8)` on `kafka_dlt-original-partition` prints nothing. Why not an exception?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because Kafka headers are `(String, byte[])` pairs, and Spring chose the natural binary encoding for a numeric value: a 4-byte big-endian `int`, the same width as Java's `int`.
+Because the bytes are valid UTF-8. They just do not mean what you hoped.
 
-It's compact and unambiguous — no charset, no parsing, no locale. `ByteBuffer.wrap(bytes).getInt()` reconstructs it exactly, and `ByteBuffer` defaults to big-endian, which matches Kafka's wire format everywhere.
+Partition 1 is the four bytes `00 00 00 01`, and every one of those is a legal UTF-8 code unit: three null characters and a start-of-heading control character. Decoding succeeds and produces a four-character string containing no printable glyphs.
 
-The cost is that decoding it as UTF-8 does not fail. `new String(new byte[]{0,0,0,1})` produces a four-character string of control characters. It prints as whitespace, logs as nothing, and never throws. You get a wrong answer silently, which is the worst kind.
+That is the dangerous shape of this bug. A decoding error that threw would be found immediately. A decoding error that silently produces an empty-looking string survives into production and makes your dead-letter records look like they have no origin information.
 
 </details>
 
-**2. Your DLT consumer throws. Trace exactly what happens.**
+**2. Why must a dead-letter consumer never throw?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The DLT listener uses the same `ConcurrentKafkaListenerContainerFactory`, so it has the same `DefaultErrorHandler` with the same backoff and the same `DeadLetterPublishingRecoverer`.
+Because it shares the container factory, and therefore the error handler and the recoverer, with the main consumer.
 
-The exception is retried on the backoff schedule (four attempts, 1 s + 2 s + 4 s) unless it's registered non-retryable. When the backoff returns `STOP`, the recoverer runs. Its destination function is `record.topic() + ".dlt"` — and `record.topic()` is now `wikimedia-stream.dlt`.
+An exception from the dead-letter listener follows exactly the same path as an exception from the main one: backoff, then the recoverer, which appends `.dlt` to the current topic. So a failure while reporting a failure produces `wikimedia-stream.dlt.dlt`, and a failure reporting that produces another level.
 
-So it publishes to `wikimedia-stream.dlt.dlt`, which doesn't exist, so the broker auto-creates it with defaults: no `min.insync.replicas=2`, 7-day retention rather than 30, and an active `retention.bytes` cap.
-
-Every durability property you configured for the DLT is absent on the topic now holding your most-failed records. And if *that* consumer existed and threw, you'd get `.dlt.dlt.dlt`.
+The fix is not a separate error handler, though that would work. It is to make the listener incapable of failing: catch everything, acknowledge in a `finally`, and do as little work as possible. A dead-letter consumer that needs a database is a dead-letter consumer that will fail when the database is the thing that broke.
 
 </details>
 
-**3. You fix the consumer bug and replay 5,000 records from the DLT. Your idempotency key is `(kafkaPartition, kafkaOffset)`. What goes wrong?**
+**3. You replay a dead-letter record after deploying a fix. Lesson 18's unique constraint does not prevent a duplicate. Why?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Every replayed record is appended to the source topic as a **new** record with a **new** offset — and probably a different partition, since the replay producer runs the partitioner afresh.
+Because the idempotency key is the record's partition and offset, and a replayed record has new ones.
 
-So `(partition, offset)` for the replayed copy differs from the original. Your unique constraint sees a brand-new key and inserts a brand-new row.
+Producing the value back to the source topic creates a genuinely new record at the end of the log. It carries the same payload and a different identity, so the constraint on partition and offset sees nothing familiar and the insert succeeds.
 
-If any of those 5,000 records had *partially* succeeded before failing — wrote a row, then threw on a downstream call — you now have two rows for one logical event. The idempotency key that protected you against redelivery does not protect you against replay, because it identifies a *physical position in the log*, not a business event.
-
-Replay-safety requires an idempotency key derived from the event's content or a producer-assigned ID: `meta.id` in the Wikimedia payload, an order ID, a request ID. Something stable across republication.
+If the original attempt had partially succeeded before failing, for example writing a row and then failing on something after it, the replay double-applies that part. Guarding against this needs idempotency on something intrinsic to the event rather than to the record that carried it, and Wikimedia gives you no such identifier, which is the honest limitation of this pipeline.
 
 </details>
 
-**4. Two DLT records exist for the same original event, and one has three sets of `kafka_dlt-exception-fqcn` headers. What happened?**
+**4. After three failures of the same record you find three `original-offset` headers and one `exception-fqcn`. Is something broken?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The record was dead-lettered, replayed, failed again, dead-lettered again, replayed again, and failed a third time.
+No, that is the documented behaviour and it is deliberate.
 
-Headers are an ordered **list**, not a map, and `DeadLetterPublishingRecoverer` *appends* rather than replaces. Each trip through the DLT adds another full set of `kafka_dlt-*` headers to the record it republishes.
+`DeadLetterPublishingRecoverer` appends the `original-*` headers, so the chain of origins is preserved and you can see the record's whole journey. It strips and replaces the `exception-*` headers, because `stripPreviousExceptionHeaders` defaults to true.
 
-So `headers().headers("kafka_dlt-exception-fqcn")` returns three values, oldest first, and `lastHeader()` returns the most recent — the exception from the latest failure. The earlier ones are the failure history, which is genuinely useful: you can see whether the exception type changed after your fix.
+The reason is size. An exception header can carry a message and, if configured, a stack trace, and a record that fails repeatedly would accumulate those without bound until it exceeded the maximum record size and could no longer be published at all.
 
-The two separate DLT records exist because each replay produced a *new* record to the source topic, and each one failed independently.
+The cost is that you only ever see the most recent failure reason. If the failure mode changed between attempts, that history is gone unless you turned stripping off.
 
 </details>
 
-**5. Your DLT consumer logs every failure at `ERROR` with full headers. Is that sufficient production handling?**
+**5. Lesson 21 said lag clears when a record is dead-lettered. What should you alert on instead?**
 
 <details>
 <summary>Reveal answer</summary>
 
-No. It makes failures *legible*, but nothing *notices* them.
+The rate of records arriving on the dead-letter topic, and ideally broken down by cause class.
 
-A log line is a message to a human who is not reading. Nothing pages, nothing goes red, and consumer lag on the source topic is zero — because dead-lettering a record is, from the source topic's perspective, a successful outcome. Every dashboard stays green while events silently stop reaching your database.
+Lag measures the distance between the log end and the committed offset. Dead-lettering advances the offset, so a pipeline discarding every single record to the dead-letter topic reports zero lag and perfect health.
 
-Sufficient handling needs three things the log gives you none of:
+A count of dead-letter records is the direct measurement of the thing you care about, and tagging it by the cause class tells you whether you are looking at one broken publisher, one bad deploy, or a database outage. Lesson 26 wires this into Prometheus.
 
-- **A metric** — a counter incremented per DLT record, so you can alert on a non-zero *rate*, not a total (a total that stopped growing an hour ago shouldn't page anyone).
-- **Durable storage** — a `dead_letter_events` table, so records outlive the DLT's 30-day retention and are queryable without a Kafka consumer.
-- **A replay path** — an authenticated endpoint that republishes a record after someone confirms the fix is deployed.
-
-The logging is the easy third of the job, and it's the part that feels finished.
+Keep the lag alert as well. The two catch different failures: lag catches a consumer that has stopped, and the dead-letter rate catches one that is running and rejecting everything.
 
 </details>
-
----
-
-## Recap
-
-Kafka headers are `(String, byte[])`, so the numeric DLT headers are big-endian ints and longs — decode them with `ByteBuffer`, not `new String`, or get control characters and no error. The seven `kafka_dlt-*` headers tell you what failed, why, and exactly where it lives on the source topic, which is what makes fetching the original possible.
-
-A DLT consumer must be the most reliable code you own, because throwing from it creates `.dlt.dlt`. And replay is a repair tool: it needs the fix deployed first, a business-level idempotency key, and an acceptance that ordering is gone.
 
 ---
 
 ## End of Part 4
 
-Your consumer is now genuinely resilient:
+Your pipeline now fails properly. It:
 
-- transient failures retry on a bounded exponential schedule, four attempts over seven seconds
-- data-level failures skip retries entirely, because retrying them blocks a partition to no purpose
-- an exhausted record is parked on a dead-letter topic, same partition, original bytes, seven diagnostic headers
-- the DLT is consumed, decoded, and logged with a full trail back to the source offset
+- retries transient failures with exponential backoff, bounded to four attempts
+- skips the backoff entirely for exceptions that cannot succeed on a retry
+- parks failed records on a dead-letter topic with their payload intact and their origin recorded
+- keeps them for 30 days with no size cap, so a Friday failure survives the weekend
+- reports them from a listener that cannot itself fail
 
-A poison pill no longer stops your pipeline, and no record is silently dropped.
+You also know why replay is a repair tool rather than a routine mechanism, and which guarantees it cannot restore.
 
-What you still can't do is *use* any of the data you've been storing.
-
-**Next:** [Lesson 23 — A REST API over consumed events →](23-rest-api-over-events.md)
+**Next:** [Lesson 23: A REST API over Consumed Events](23-rest-api-over-events.md)

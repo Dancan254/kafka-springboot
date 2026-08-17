@@ -71,7 +71,7 @@ Confirm three things:
 |---|---|---|
 | Status | `Online` | The UI reached the broker and got metadata back |
 | Brokers | `1` | One node in the cluster |
-| Version | `4.2-IV1` | The metadata version the cluster negotiated, so Kafka 4.2 |
+| Version | a string like `4.2-IV1` | The metadata version the cluster negotiated, which tracks Apache Kafka's version rather than the image tag |
 
 Now look at the topic count. It is **zero**.
 
@@ -149,17 +149,15 @@ Getting the same answer from two tools is not busywork. It is the habit that wil
 
 ## Try it yourself
 
-1. The Dashboard reports the cluster version as `4.2-IV1`. Now ask the broker what version it thinks it is:
+1. Note the metadata version on the Dashboard, then ask the broker what version it thinks it is:
 
    ```bash
    docker exec kafka-1 kafka-topics --version
    ```
 
-   ```
-   8.2.2-ccs
-   ```
+   You now have three different numbers: the image tag from your Compose file, the `-ccs` string this command prints, and the metadata version the Dashboard showed. On `cp-kafka:8.2.2` those are `8.2.2`, `8.2.2-ccs` and `4.2-IV1` respectively; on a newer tag the first two rise together and the third rises independently.
 
-   Three different numbers are now in play: the image tag `8.2.2`, this `8.2.2-ccs`, and the cluster's `4.2-IV1`. Work out which of them is Confluent's packaging version and which is Apache Kafka's, then explain why a cluster tracks a *metadata* version separately from its software version at all. What would break during a rolling upgrade if it did not?
+   Work out which of the three is Confluent's packaging version and which is Apache Kafka's own, then explain why a cluster tracks a *metadata* version separately from its software version at all. What would break during a rolling upgrade if it did not?
 
 2. Ask the broker what it thinks `__consumer_offsets` should look like, before the topic exists:
 

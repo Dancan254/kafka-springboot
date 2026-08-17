@@ -1,504 +1,610 @@
-# Lesson 26 — Observability
+# Lesson 26: Observability
 
-> **Part 5 — Production** · 35 minutes
+> **Part 5: Production**
 
 ---
 
 ## What you'll learn
 
-- How metrics, traces, and logs flow from a Spring Boot 4 app to Prometheus, Tempo, and Loki
-- Why consumer lag is the only Kafka metric you must alert on
-- How a trace follows a record across the producer/consumer boundary
-- Four real misconfigurations in this repository's observability stack, and how each one failed silently
+- Which of the three signals Spring Boot exports for free, and which one needs four pieces of wiring
+- Why metrics are scraped while traces and logs are pushed
+- How a trace crosses the Kafka boundary from producer to consumer
+- Four ways this stack fails silently, and how to confirm each one
 
 ---
 
 ## Why this matters
 
-Your pipeline is durable, resilient, tested, and typed. If it stopped working right now, you would find out from a user.
+You have a pipeline with a producer, three brokers, three consumer threads, a database and a dead-letter topic. When it misbehaves at 3 a.m., the question is never "is Kafka up". It is "where did this record go, and why is that partition behind".
 
-Kafka's failure modes are unusually quiet. A consumer that dies leaves lag climbing on a broker nobody is watching. A dead-letter topic absorbs records and reports zero lag on the source topic, because dead-lettering *is* a successful outcome. A partition blocked by a poison pill affects one third of throughput and nothing else.
+Lesson 22 also left you with a specific problem: dead-lettering a record advances the offset, so lag clears and the pipeline reports itself healthy while discarding everything. You need a signal that catches that.
 
-None of these throw. None of them fail a health check. Observability is not a nice-to-have on a Kafka pipeline; it is the only way to know it is working.
-
-This lesson also contains four bugs that were live in this repository. Every one of them broke a signal silently — the containers were running, no errors were logged, and no data arrived. That is the normal way observability fails.
+The other reason this lesson exists is that observability fails quietly. A misconfigured exporter does not crash your application, it just produces an empty dashboard, and an empty dashboard looks like a healthy system.
 
 ---
 
 ## Before you start
 
-[Lesson 25](25-schema-registry-and-avro.md). The full stack from Lesson 00 running.
+[Lesson 25](25-schema-registry-and-avro.md). If you skipped the Avro migration, everything here works identically on the JSON version.
 
 ---
 
 ## The concept
 
-### Three signals, one protocol
+### Three signals, two directions
 
-**Metrics** are aggregates over time: lag, request rate, heap used. Cheap, always on, the basis of alerts.
+| Signal | Direction | Mechanism |
+|---|---|---|
+| Metrics | pulled | Prometheus scrapes `/actuator/prometheus` |
+| Traces | pushed | OTLP to Tempo |
+| Logs | pushed | OTLP to Loki |
 
-**Traces** are the causal path of one operation across services: an HTTP request → a Kafka produce → a Kafka consume → a database write, as a single waterfall with timings.
+Metrics are scraped because they are a current value that can be sampled at any time, and because scraping gives you a free liveness check: a target that stops answering is visibly down. Traces and logs are events that already happened, so there is nothing to sample and they have to be sent.
 
-**Logs** are discrete events with context. Correlated to traces by `traceId`, they answer "what exactly happened during that slow span."
+This is also why `kafka-exporter` exists. Brokers speak Kafka's protocol, not Prometheus, so the exporter translates consumer group lag and topic offsets into a scrapeable endpoint.
 
-**OTLP** (OpenTelemetry Protocol) carries all three. Spring Boot 4's `spring-boot-starter-opentelemetry` pushes them over OTLP HTTP to a collector, which fans them out to a backend per signal.
+### What Spring Boot gives you, and what it does not
 
-```mermaid
-flowchart LR
-    P["Producer :8081"] -->|OTLP HTTP| C["OTel Collector :4318"]
-    CO["Consumer :8082"] -->|OTLP HTTP| C
-    C -->|metrics| PR["Prometheus :9090"]
-    C -->|traces| T["Tempo :4318"]
-    C -->|logs| L["Loki :3100"]
-    KE["kafka-exporter :9308"] -->|scrape| PR
-    PR & T & L --> G["Grafana :3001"]
-```
+This is the part worth being precise about, because two of the three signals are nearly free and one is not.
 
-Two things arrive at Prometheus by different routes. The apps **push** metrics to the collector, which exposes them for Prometheus to **pull** on `:8889`. `kafka-exporter` is scraped directly — it reads consumer lag and topic offsets from the Kafka admin API and exposes them as Prometheus metrics. Your apps cannot report their own lag accurately; only the broker knows the log end offset.
+**Metrics are configuration.** Micrometer already instruments your application, Kafka clients, the JVM, HikariCP and the web layer. Adding a registry and exposing an endpoint is all that is required.
 
-### Consumer lag is the metric
+**Traces are configuration plus one trap.** `spring-boot-starter-opentelemetry` bundles the OTel SDK and the Micrometer tracing bridge. Set the endpoint, and set `management.tracing.sampling.probability` explicitly, because it defaults to **0.1** and will silently discard 90% of your traces.
 
-If you alert on one thing, alert on this:
+**Logs need four separate things**, and none of them is automatic:
 
-```promql
-kafka_consumergroup_lag{consumergroup="wikimedia-consumer-group"}
-```
+1. the `opentelemetry-logback-appender-1.0` dependency
+2. a `logback-spring.xml` registering that appender on the root logger
+3. a bean that installs the SDK into the appender after the context is ready
+4. the logging OTLP endpoint property
 
-Lag is `log end offset − committed offset`, per partition. It captures every failure mode in one number, regardless of cause:
+Step 3 is the one that surprises people. Logback initialises before the Spring context exists, so the appender is constructed before the `OpenTelemetry` bean does. `OpenTelemetryAppender.install(openTelemetry)` retro-fits the SDK into the already-running appender. Without it the appender is present, accepts every log event, and exports nothing, with no error anywhere.
 
-- consumer crashed → lag climbs
-- consumer slow → lag climbs
-- database down → lag climbs (because you ack after the write — Lesson 18)
-- partition blocked by a poison pill → lag climbs on *that partition only*
+### The two property prefixes
 
-And it has a deadline attached. Once lag exceeds what retention will hold, records are deleted unread.
-
-CPU tells you nothing. A consumer pinned at 100% CPU and keeping up is fine. A consumer at 2% CPU blocked on a slow database is an incident.
-
-**Alert on the rate of change, not the absolute value.** Lag of 50,000 during a replay is expected. Lag growing steadily for ten minutes is not.
-
-The one thing lag *cannot* see: a consumer group with no members. Zero lag and zero consumers looks identical to zero lag and a healthy consumer. Alert on both.
-
-### Traces across the Kafka boundary
-
-A trace normally follows a thread. Kafka breaks that — the producer's thread ends, and minutes later a different process picks the record up.
-
-Spring Kafka bridges it by injecting the W3C `traceparent` header into the record. The consumer extracts it and continues the trace. This is why `KafkaConsumerConfig` sets:
-
-```java
-factory.getContainerProperties().setObservationEnabled(true);
-```
-
-Without that line the consumer's spans exist but are **not linked** to the producer's. You get two disconnected traces and no way to see that they're the same record.
-
-Headers again — the same mechanism that carried the DLT diagnostics in Lesson 22.
-
----
-
-## The four bugs
-
-Everything above describes how it should work. Here is how this repository actually behaved, and why each failure was invisible.
-
-### Bug 1 — The apps pushed to a hostname that doesn't exist
+There are two, because there are two export paths, and mixing them up is the most common configuration failure here.
 
 ```yaml
 management:
   otlp:
     metrics:
       export:
-        url: http://otel-collector:4318/v1/metrics
-```
-
-`otel-collector` is a **Docker network hostname**. It resolves from inside the compose network. The README tells you to run the apps on the host with `./mvnw spring-boot:run`, where that name resolves to nothing.
-
-Every metric, trace, and log export failed with an unresolvable host. The apps started fine and served traffic. The exporter retried in a background thread and logged at a level nobody had enabled.
-
-**The fix** makes the default correct for the documented workflow, and still allows containerised runs:
-
-```yaml
-  otlp:
-    metrics:
-      export:
-        url: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/metrics
-        enabled: true
+        url: ...            # Micrometer's OTLP registry
   opentelemetry:
     tracing:
       export:
         otlp:
-          endpoint: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/traces
+          endpoint: ...     # the OTel SDK
     logging:
       export:
         otlp:
-          endpoint: ${OTEL_COLLECTOR_URL:http://localhost:4318}/v1/logs
-  tracing:
-    sampling:
-      probability: 1.0
+          endpoint: ...     # the OTel SDK
 ```
 
-Run the app inside compose instead? Set `OTEL_COLLECTOR_URL=http://otel-collector:4318`.
+Metrics go through Micrometer, so they use `management.otlp.metrics`. Traces and logs go through the OTel SDK, so they use `management.opentelemetry`. A property under the wrong prefix binds to nothing and is ignored in silence.
 
-> `sampling.probability: 1.0` traces every request. Correct for a demo, ruinous in production — sample at 1–10%, or use tail sampling in the collector to keep only the slow and failed traces.
+This lesson scrapes metrics rather than pushing them, so you will only use the second prefix. The first is here because you will meet it, and because knowing there are two is what stops you searching for a property that does not exist.
 
-### Bug 2 — The collector shipped traces into a 404
+### No collector, and why
 
-```yaml
-exporters:
-  otlphttp/tempo:
-    endpoint: http://tempo:3200/otlp
+The production-standard architecture puts an OpenTelemetry Collector between your applications and the backends. It decouples the app from the storage choice, batches and retries centrally, and lets you change backends without redeploying anything.
+
+This lesson exports directly to Tempo and Loki instead, for one reason: a collector adds a container, a config file, and a hop where every endpoint can be wrong. Two of the four silent failures below were originally collector misconfigurations, and they are more instructive when they are yours.
+
+Add the collector when you have more than a couple of services, or when you want to change backends without touching application config. The closing exercise walks through inserting one.
+
+### How a trace crosses Kafka
+
+A trace is a tree of spans sharing a trace ID. The interesting part here is that the producer and consumer are separate processes.
+
+```mermaid
+flowchart LR
+    H["curl<br/>/api/v1/wikimedia"] --> S1["span: HTTP GET<br/>producer"]
+    S1 --> S2["span: kafka send<br/>producer"]
+    S2 -->|"traceparent header<br/>on the record"| S3["span: kafka receive<br/>consumer"]
+    S3 --> S4["span: repository save<br/>consumer"]
 ```
 
-Tempo listens on **3200 for its query API** and **4318 for OTLP ingest**. Posting traces to `3200/otlp/v1/traces` returns `404`.
+The link is a `traceparent` header on the Kafka record, which is exactly the use for headers that Lesson 22 described. Micrometer's instrumentation writes it on send and reads it on receive, so the consumer's spans join the producer's trace.
 
-You can verify it yourself:
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  -H 'Content-Type: application/json' -d '{"resourceSpans":[]}' \
-  http://localhost:3200/otlp/v1/traces
-```
-
-`404`. The collector's `otlphttp` exporter appends `/v1/traces` to whatever endpoint you give it, so the endpoint must be the host and port only:
-
-```yaml
-exporters:
-  otlphttp/tempo:
-    endpoint: http://tempo:4318
-    tls:
-      insecure: true
-```
-
-The collector retried, logged at debug, and reported itself healthy the entire time.
-
-### Bug 3 — Tempo never started, and `docker compose ps` hid it
-
-`tempo-config.yml` set two top-level keys:
-
-```yaml
-ingester:
-  max_block_duration: 5m
-compactor:
-  compaction:
-    block_retention: 1h
-```
-
-Tempo 2.10 **removed both**, replacing them with `live_store`, `block_builder`, and `backend_scheduler`. Tempo exited immediately:
-
-```
-failed parsing config: field ingester not found in type app.Config
-```
-
-Two things made this invisible. `docker compose ps` lists running services, so an exited container simply wasn't in the output — you had to run `docker compose ps -a`. And the image was pinned to `grafana/tempo:latest`, so a working setup silently acquired a breaking change on some later `docker compose pull`.
-
-**The fix** removes the dead keys and pins the tag:
-
-```yaml
-# docker-compose.yml
-tempo:
-  image: grafana/tempo:2.10.4
-```
-
-This is the concrete argument for the rule *never use `latest`*. The config was correct when it was written. The image moved underneath it.
-
-> Removing the `compactor` block means Tempo's default block retention applies rather than 1 hour. Fine locally; set it explicitly under the new keys if it matters.
-
-### Bug 4 — The log appender threw on a background thread
-
-```
-Exception in thread "BatchLogRecordProcessor_WorkerThread-1"
-java.lang.NoClassDefFoundError: io/opentelemetry/api/incubator/common/ExtendedAttributes
-```
-
-`opentelemetry-logback-appender-1.0:2.29.0-alpha` needs `opentelemetry-api-incubator`, which is not a transitive dependency and is not in the OpenTelemetry BOM that Spring Boot manages (it lives in `opentelemetry-bom-alpha`).
-
-The application started, served requests, and logged normally to the console. Only the *log export thread* died, so logs never reached Loki. Nothing in the request path noticed.
-
-**The fix** — add the missing artifact, versioned against the OTel version Spring Boot already manages:
-
-```xml
-<dependency>
-    <groupId>io.opentelemetry.instrumentation</groupId>
-    <artifactId>opentelemetry-logback-appender-1.0</artifactId>
-    <version>2.29.0-alpha</version>
-</dependency>
-<dependency>
-    <groupId>io.opentelemetry</groupId>
-    <artifactId>opentelemetry-api-incubator</artifactId>
-    <version>${opentelemetry.version}-alpha</version>
-</dependency>
-```
-
-`${opentelemetry.version}` is inherited from `spring-boot-dependencies` (1.62.0 in Boot 4.1.0), so the two stay aligned across upgrades.
-
-**The pattern across all four:** every one of these failed on a background thread, in a retry loop, or in a container that had already exited. None of them affected a request. This is what observability failure looks like — the system that tells you things are broken is itself broken, and by construction it cannot tell you.
-
-The only reliable check is to send a signal end-to-end and confirm it arrives.
+That only happens if the listener container has observation enabled, which is one line and is otherwise off.
 
 ---
 
 ## Hands-on
 
-### 1. Verify each signal end-to-end
+### 1. Add the observability stack
 
-Don't trust "the container is up." Push a signal and read it back.
+Append to `docker-compose.yml`:
+
+```yaml
+  prometheus:
+    image: prom/prometheus:v3.13.2
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - kafka-network
+
+  tempo:
+    image: grafana/tempo:3.0.3
+    container_name: tempo
+    ports:
+      # 3200 is the query API that Grafana reads. 4318 is OTLP ingest, which
+      # your applications write to. Both must be published, because the apps
+      # run on your machine rather than in this network.
+      - "3200:3200"
+      - "4318:4318"
+    command: [ "-config.file=/etc/tempo/tempo.yml" ]
+    volumes:
+      - ./tempo-config.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    networks:
+      - kafka-network
+
+  loki:
+    image: grafana/loki:3.7.6
+    container_name: loki
+    ports:
+      - "3100:3100"
+    networks:
+      - kafka-network
+
+  grafana:
+    image: grafana/grafana:13.1.3
+    container_name: grafana
+    # The container listens on 3000. It is published on 3001 to stay clear of
+    # anything else you may be running.
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - kafka-network
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: kafka-exporter
+    ports:
+      - "9308:9308"
+    command:
+      - '--kafka.server=kafka-1:29092'
+      - '--kafka.server=kafka-2:29092'
+      - '--kafka.server=kafka-3:29092'
+    networks:
+      - kafka-network
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+```
+
+And add the new volumes:
+
+```yaml
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  prometheus-data:
+  tempo-data:
+  grafana-data:
+```
+
+Every tag is pinned. Note the Tempo comment: this is the one image where a version bump is a config change, and the pin is load-bearing rather than habitual.
+
+### 2. `prometheus.yml`
+
+Create it next to `docker-compose.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Consumer group lag and topic offsets, translated from Kafka's protocol.
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  # The applications run on your machine, not in the Docker network, so
+  # Prometheus reaches them through the host gateway.
+  - job_name: wikimedia-producer
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+
+  - job_name: wikimedia-consumer
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['host.docker.internal:8082']
+```
+
+`host.docker.internal` is how a container reaches a process on your machine. On Linux without Docker Desktop you may need `extra_hosts: ["host.docker.internal:host-gateway"]` on the Prometheus service.
+
+This asymmetry is worth noticing: Prometheus reaches into the host to scrape, while your applications reach into the Docker network to push. It is the same two-address problem from Lesson 00, now in both directions at once.
+
+### 3. `tempo-config.yml`
+
+```yaml
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+usage_report:
+  reporting_enabled: false
+```
+
+Note the two ports. **3200 is the query API** that Grafana reads from, and **4318 is the OTLP ingest** that your applications write to. Posting traces to 3200 returns a 404, which is the third silent failure below.
+
+This is Tempo running as a single binary, which is why the config is this short. Tempo 3.0 reorganised its clustered deployment substantially, replacing the `ingester` and `compactor` components with `live_store`, `block_builder` and a backend scheduler, and its microservices configuration requires Kafka for ingest. None of that applies here: a single-binary local Tempo needs a server port, a receiver and somewhere to put blocks, and that shape is unchanged.
+
+The lesson is worth generalising. A major version bump that breaks a clustered deployment can leave a simple one untouched, so "3.x renamed the config" is true and not necessarily true of *your* config. Read the migration notes for the deployment mode you actually run.
+
+### 4. Add the dependencies, in both projects
+
+```xml
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-opentelemetry</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- Bridges Logback events into the OTel SDK. Not pulled in by the starter. -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-logback-appender-1.0</artifactId>
+            <version>2.29.0-alpha</version>
+        </dependency>
+
+        <!-- Required by the log appender at runtime. Without it the log export
+             thread dies with NoClassDefFoundError on ExtendedAttributes and no
+             log ever reaches Loki. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api-incubator</artifactId>
+            <version>${opentelemetry.version}-alpha</version>
+        </dependency>
+```
+
+`${opentelemetry.version}` is managed by Spring Boot's BOM, currently 1.62.0, so the alpha artifact stays aligned with the stable ones automatically.
+
+The starter exports; it does not instrument. Micrometer does the instrumenting and is already in your application. The starter bundles the OTel API and SDK plus the Micrometer tracing bridge so those signals can be shipped over OTLP.
+
+It also does not require actuator, which you added separately in Lesson 12 and Lesson 15.
+
+### 5. Configure both applications
+
+Replace the `management` block in each `application.yml`:
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+  # Traces and logs go through the OTel SDK, so they use the
+  # management.opentelemetry prefix. Metrics are scraped, not pushed, so
+  # management.otlp.metrics is deliberately absent.
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: http://localhost:4318/v1/traces
+    logging:
+      export:
+        otlp:
+          endpoint: http://localhost:3100/otlp/v1/logs
+
+  tracing:
+    sampling:
+      # Defaults to 0.1, which silently discards 90% of traces. Fine locally,
+      # ruinous at scale, and always worth setting explicitly.
+      probability: 1.0
+```
+
+Add `prometheus` to the exposure list or `/actuator/prometheus` returns 404 while the metrics are collected perfectly well, which is the first silent failure below.
+
+The endpoints are `localhost` because the applications run on your machine and Docker publishes those ports. Running them inside the Compose network instead means `http://tempo:4318` and `http://loki:3100`.
+
+### 6. Wire up log export
+
+`src/main/resources/logback-spring.xml`, in both projects:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/base.xml"/>
+
+    <appender name="OTEL"
+              class="io.opentelemetry.instrumentation.logback.appender.v1_0.OpenTelemetryAppender"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="OTEL"/>
+    </root>
+</configuration>
+```
+
+And the bean that makes it work, in each project's base package:
+
+```java
+package com.example.wikimedia.consumer.observability;
+
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.instrumentation.logback.appender.v1_0.OpenTelemetryAppender;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.stereotype.Component;
+
+/**
+ * Logback initialises before the Spring context, so the OTEL appender is created
+ * before the OpenTelemetry bean exists. This installs the SDK into the appender
+ * once the context is ready. Without it the appender silently exports nothing.
+ */
+@Component
+class OpenTelemetryAppenderInstaller implements InitializingBean {
+
+    private final OpenTelemetry openTelemetry;
+
+    OpenTelemetryAppenderInstaller(OpenTelemetry openTelemetry) {
+        this.openTelemetry = openTelemetry;
+    }
+
+    @Override
+    public void afterPropertiesSet() {
+        OpenTelemetryAppender.install(openTelemetry);
+    }
+}
+```
+
+### 7. Join the trace across Kafka
+
+One line in the consumer's `KafkaConsumerConfig`:
+
+```java
+        factory.getContainerProperties().setObservationEnabled(true);
+```
+
+This makes the listener container create a span per record and read the `traceparent` header, so consumer spans join the producer's trace. Without it you get two unrelated traces and no way to follow a record across the boundary.
+
+### 8. Run it and verify each signal separately
+
+```bash
+docker compose up -d
+```
+
+Verify them one at a time, because a single blank dashboard cannot tell you which of four things is broken.
+
+**Metrics, at the source:**
+
+```bash
+curl -s localhost:8082/actuator/prometheus | grep -c '^kafka'
+```
+
+A non-zero count. If it is 404, `prometheus` is missing from your exposure list.
+
+**Metrics, at Prometheus:** open `http://localhost:9090/targets`. All four targets should be `UP`. A target that is `DOWN` with a connection error is the `host.docker.internal` problem from step 2.
 
 **Traces:**
 
 ```bash
-TRACE_ID=$(openssl rand -hex 16)
-NOW=$(( $(date +%s) * 1000000000 ))
-
-curl -s -o /dev/null -w 'POST /v1/traces -> %{http_code}\n' \
-  -X POST -H 'Content-Type: application/json' \
-  -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"probe\"}}]},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"$TRACE_ID\",\"spanId\":\"$(openssl rand -hex 8)\",\"name\":\"probe-span\",\"kind\":1,\"startTimeUnixNano\":\"$NOW\",\"endTimeUnixNano\":\"$(( NOW + 1000000 ))\"}]}]}]}" \
-  http://localhost:4318/v1/traces
-
-sleep 5
-curl -s "http://localhost:3200/api/traces/$TRACE_ID" | head -c 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:4318/v1/traces \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
-If the span comes back, the whole chain works: app → collector → Tempo.
+Anything other than a connection failure means Tempo's OTLP receiver is listening. A 404 means you are talking to 3200.
 
 **Logs:**
 
 ```bash
-curl -s -o /dev/null -w 'POST /v1/logs -> %{http_code}\n' \
-  -X POST -H 'Content-Type: application/json' \
-  -d "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"probe\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"$(( $(date +%s) * 1000000000 ))\",\"severityText\":\"ERROR\",\"body\":{\"stringValue\":\"probe-line\"}}]}]}]}" \
-  http://localhost:4318/v1/logs
-
-sleep 5
-curl -sG 'http://localhost:3100/loki/api/v1/query_range' \
-  --data-urlencode '{service_name="probe"}' | head -c 200
+curl -s 'localhost:3100/loki/api/v1/labels'
 ```
 
-**Metrics:**
+Then trigger some traffic and query for your service.
 
-```bash
-curl -s 'http://localhost:9090/api/v1/targets?state=active' \
-  | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'
-```
+### 9. The four ways this fails silently
 
-```
-kafka-exporter up
-otel-collector up
-```
+Every one of these leaves your application healthy and a dashboard empty. Each is worth causing on purpose once.
 
-Both `up`, or your metrics never arrive.
+**The appender that exports nothing.** Delete the `OpenTelemetryAppenderInstaller` bean. Logs still appear on the console, the OTEL appender still receives every event, and Loki receives nothing. There is no error, because an appender with no SDK installed is a functioning appender with nowhere to send.
 
-### 2. Watch lag climb, then drain
+*Confirm it:* query Loki for your service and get an empty result while `docker compose logs` shows plenty of output.
 
-The single most useful thing in this lesson.
+**The missing incubator dependency.** Remove `opentelemetry-api-incubator`. The log export thread dies with `NoClassDefFoundError` on `ExtendedAttributes`. This one does produce a stack trace, once, at startup, in among the banner, and then never again.
 
-With the producer streaming and the consumer running, open **http://localhost:9090/graph** and run:
+*Confirm it:* search your application's own startup output for `NoClassDefFoundError` before assuming Loki is at fault.
+
+**Traces posted to the query port.** Point the tracing endpoint at `http://localhost:3200/v1/traces`. Tempo answers, with a 404, and the OTel SDK logs an export failure at a level you are probably not watching.
+
+*Confirm it:* the curl in step 8 distinguishes the two ports in one command.
+
+**Sampling at the default.** Remove `management.tracing.sampling.probability`. It reverts to 0.1, so nine out of ten traces never leave the application. Your dashboards are not empty, which is what makes this the worst of the four: they are 90% incomplete, and the traces you happen to look for are usually the missing ones.
+
+*Confirm it:* produce ten records and count the traces in Grafana.
+
+### 10. Wire up Grafana
+
+Open `http://localhost:3001`, log in with `admin` and `admin`, and add three data sources under Connections:
+
+| Type | URL |
+|---|---|
+| Prometheus | `http://prometheus:9090` |
+| Tempo | `http://tempo:3200` |
+| Loki | `http://loki:3100` |
+
+Container hostnames, not `localhost`, because Grafana is inside the Docker network.
+
+Note that Tempo's data source is the **query** port, while your application writes to 4318. Same service, two ports, two different jobs.
+
+Then import dashboard **7589** for Kafka Exporter and **12900** for JVM Micrometer.
+
+### 11. The query that matters
+
+The metric to alert on is consumer lag:
 
 ```promql
-kafka_consumergroup_lag{consumergroup="wikimedia-consumer-group"}
-```
-
-Near zero across three partitions. Now stop the consumer:
-
-```bash
-# Ctrl-C the consumer
-```
-
-Refresh. Lag climbs, per partition, linearly with the producer's rate. Nothing has failed. No exception exists anywhere. The only evidence that your pipeline is broken is this graph.
-
-Restart the consumer and watch it drain back to zero. That drain rate — how fast a consumer catches up — is your real recovery-time budget after an outage.
-
-Other queries worth knowing:
-
-```promql
-# Total lag across partitions — the number to alert on
 sum(kafka_consumergroup_lag{consumergroup="wikimedia-consumer-group"})
-
-# Is anyone consuming at all?
-kafka_consumergroup_members{consumergroup="wikimedia-consumer-group"}
-
-# Producer throughput proxy: the write head
-kafka_topic_partition_current_offset{topic="wikimedia-stream"}
-
-# Records landing on the dead-letter topic (should be flat at zero)
-rate(kafka_topic_partition_current_offset{topic="wikimedia-stream.dlt"}[5m])
-
-# JVM heap
-jvm_memory_used_bytes{job="otel-collector", area="heap"}
 ```
 
-That fourth query is the DLT alert Lesson 21 said you needed. A non-zero rate means records are being parked, and the source topic's lag will stay at zero while it happens.
+And the one Lesson 22 said you also need, because dead-lettering clears lag:
 
-### 3. Grafana
-
-Open **http://localhost:3001** — port **3001**, not 3000. The container listens on 3000 internally; compose maps it to 3001 on the host to avoid a collision.
-
-Log in `admin` / `admin`. Add three data sources under **Connections → Data Sources**, using the *internal* hostnames, because Grafana connects from inside the Docker network:
-
-| Name | Type | URL |
-|---|---|---|
-| Prometheus | Prometheus | `http://prometheus:9090` |
-| Tempo | Tempo | `http://tempo:3200` |
-| Loki | Loki | `http://loki:3100` |
-
-Tempo's data source URL *is* `3200` — that's the query API. Ingest is 4318. Getting these two backwards is Bug 2 in the other direction.
-
-Import two dashboards (**Dashboards → Import**):
-
-- **7589** — Kafka Exporter Overview: consumer lag, topic offsets, partition leaders
-- **12900** — JVM (Micrometer): heap, GC, threads, HTTP rates
-
-### 4. Follow one record through a trace
-
-**Explore → Tempo**, search by service name `consumer`.
-
-Open a trace and you should see the listener invocation as a span, with the JDBC insert nested beneath it. That nesting is `setObservationEnabled(true)` doing its job.
-
-Now remove that line from `KafkaConsumerConfig`, restart, and look again. The database span is still there. The Kafka consume span isn't — and nothing links the consumer's work to the producer's send.
-
-Restore it.
-
-### 5. Correlate a log to a trace
-
-**Explore → Loki**:
-
-```logql
-{service_name="consumer"}                          # all consumer logs
-{service_name=~"producer|consumer"} |= "ERROR"     # errors across both
-{service_name="consumer"} |= "DLT"                 # dead-letter failures
+```promql
+sum(rate(kafka_topic_partition_current_offset{topic="wikimedia-stream.dlt"}[5m]))
 ```
 
-Each line carries an OTel `traceId`. In the Tempo data source settings, enable **Trace to logs** and point it at Loki. Now clicking a span jumps to the logs emitted during it.
+Those two together cover both failure shapes. Rising lag means a consumer that has stopped or fallen behind. A rising dead-letter rate with flat lag means a consumer that is running fine and rejecting everything it receives.
 
-That is the payoff of pushing all three signals through one collector: a slow trace, and the exact log lines that fired inside the slow span.
+Alerting on only the first is how a pipeline discards a day of records while every graph looks healthy.
 
 ---
 
 ## Try it yourself
 
-1. Stop the consumer and let lag reach 10,000. Write the PromQL alert you'd page on. Should it fire on `sum(lag) > 10000`, or on `deriv(sum(lag)[5m]) > 0` sustained? What does each miss?
+1. Trigger the stream, then find a single record's full trace in Grafana: the HTTP request, the send, the receive and the database write. Confirm the producer and consumer spans share one trace ID. Then remove `setObservationEnabled(true)` and look again.
 
-2. Set `sampling.probability: 0.1`. Produce 100 records. How many traces appear in Tempo? Now reason about what you lose when the one failing request in 1,000 isn't sampled.
+2. Set `probability: 0.1`, produce exactly 100 records, and count the traces. Then explain why sampling is applied at the start of a trace rather than per span.
 
-3. Kill the consumer group entirely (no members). What does `kafka_consumergroup_lag` report? Write the second alert that catches this, and explain why lag alone cannot.
+3. Add a Micrometer counter for dead-letter records, tagged by the cause class from Lesson 22's header decoding. Graph it next to lag, then produce a poison pill and watch the two move in opposite directions.
 
-4. Break Bug 2 again — point the collector at `http://tempo:3200`. Does the collector log an error? Does `docker compose ps` show anything wrong? How long would it take you to notice in production?
-
-5. Produce a malformed record so it lands on the DLT. Does source-topic lag move? Does any alert fire? Write the one that would.
+4. Insert an OpenTelemetry Collector. Add `otel/opentelemetry-collector-contrib:0.158.0` with a config that receives OTLP and exports to Tempo and Loki, then point both applications at the collector instead. What did you gain, and which two of the four silent failures above did you just reintroduce?
 
 ---
 
 ## Common mistakes
 
-**Using a Docker hostname in an app that runs on the host.**
-`otel-collector:4318` resolves inside the network only. Bug 1.
+**Omitting `prometheus` from the actuator exposure list.**
+The metrics are collected and the endpoint returns 404.
 
-**Sending OTLP to Tempo's query port.**
-3200 is queries, 4318 is ingest. Bug 2.
+**Leaving `management.tracing.sampling.probability` unset.**
+It defaults to 0.1 and discards 90% of traces without telling you.
 
-**Pinning images to `latest`.**
-Your config silently stops matching the image. Bug 3.
+**Putting tracing properties under `management.otlp`.**
+Metrics use that prefix; traces and logs use `management.opentelemetry`. The wrong prefix binds to nothing.
 
-**Trusting `docker compose ps`.**
-It omits exited containers. Use `-a`.
+**Expecting log export to work from the dependency alone.**
+It needs the appender registered in `logback-spring.xml` and the SDK installed into it at runtime.
 
-**Assuming a started app means working telemetry.**
-All four bugs left the app healthy and serving traffic. Send a probe signal and read it back.
+**Omitting `opentelemetry-api-incubator`.**
+The log export thread dies with `NoClassDefFoundError` and only says so once.
 
-**Alerting on absolute lag.**
-A replay legitimately produces huge lag. Alert on sustained growth, plus member count.
+**Posting traces to Tempo's port 3200.**
+That is the query API. Ingest is 4318.
 
-**Alerting only on source-topic lag.**
-Dead-lettered records reduce lag. A pipeline can be discarding every record with lag pinned at zero.
+**Using `localhost` in Grafana's data source URLs.**
+Grafana is in the Docker network and needs container hostnames.
 
-**`sampling.probability: 1.0` in production.**
-Full-fidelity tracing at scale costs more than the service.
+**Alerting on lag alone.**
+Dead-lettering advances the offset, so a consumer rejecting everything reports zero lag.
 
-**Forgetting `setObservationEnabled(true)`.**
-Consumer spans exist but never link to the producer's trace.
+**Bumping the Tempo image without reading its changelog.**
+3.x renamed configuration keys, and the container will reject the config in this lesson.
 
 ---
 
 ## Check your understanding
 
-**1. Your consumer has been dead for an hour. CPU is 0%, no exceptions, health endpoint returns UP. Which signal tells you, and why do the others fail?**
+**1. Why are metrics scraped while traces and logs are pushed?**
 
 <details>
 <summary>Reveal answer</summary>
 
-**Consumer lag**, climbing linearly for an hour.
+Because they are different kinds of data.
 
-The others fail because nothing is wrong *inside the process*. CPU is 0% because it isn't doing anything — which is indistinguishable from an idle, healthy consumer. There are no exceptions because a consumer that crashed already logged its last one, and a consumer that was evicted from the group throws nothing. The health endpoint reports on the Spring context, which is up.
+A metric is a current value. It exists whether or not anyone asks, so it can be sampled at any interval, and pulling it gives you a free liveness signal: a target that stops answering is visibly down, which is information you would otherwise have to invent.
 
-Lag is measured by `kafka-exporter` against the **broker**, not against your application. It compares the topic's log end offset with the group's committed offset. Neither number comes from your process, which is exactly why it survives your process being wrong.
+A trace or a log is an event that already happened. There is no current value to sample, so the application has to send it when it occurs. Nobody can scrape something that existed for two milliseconds.
 
-The corollary: if your consumer's health check is the only thing you alert on, a consumer evicted from its group by `max.poll.interval.ms` (Lesson 19) reports perfect health while consuming nothing.
+That is also why a push pipeline needs its own health checks. An application that has stopped exporting traces looks identical to one that is idle.
 
 </details>
 
-**2. All four bugs left the applications healthy and serving traffic. What do they have in common structurally?**
+**2. You add the logback appender dependency and the endpoint property, and no logs reach Loki. What is missing?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Every one failed **off the request path**, in a place with no caller to propagate an error to.
+The runtime install, and possibly the incubator dependency.
 
-- Bug 1: the OTLP exporter runs on a background thread and retries. An unresolvable hostname is its problem, not the HTTP handler's.
-- Bug 2: the collector retried the export, logged at debug, and continued reporting healthy.
-- Bug 3: Tempo exited at startup — before it could ever be asked for anything — and `docker compose ps` doesn't list exited containers.
-- Bug 4: `BatchLogRecordProcessor_WorkerThread-1` died. A dead daemon thread doesn't fail a health check.
+Logback initialises before the Spring context, so the OTEL appender is constructed before an `OpenTelemetry` bean exists to give it. It runs happily with no SDK attached, accepting every log event and exporting none of them, and it does not consider that an error.
 
-Telemetry is by design asynchronous, best-effort, and fire-and-forget, so that it never slows or breaks the application. The price is that when it breaks, the application cannot tell you — and neither can the telemetry, because it's the thing that's broken.
+`OpenTelemetryAppender.install(openTelemetry)`, called once the context is ready, is what connects the two. That is the entire job of the installer bean.
 
-The only reliable verification is end-to-end: emit a known signal, then query the backend for it. That's what the probes in step 1 do, and it's why "the container is up" is not evidence.
+If the install is present and logs still do not arrive, look for `NoClassDefFoundError` on `ExtendedAttributes` in your startup output, which means `opentelemetry-api-incubator` is absent and the export thread died early.
 
 </details>
 
-**3. Consumer lag is flat at zero. Records are being dead-lettered at 50/second. Is any alert firing?**
+**3. Which prefix does each signal use, and what happens if you get it wrong?**
 
 <details>
 <summary>Reveal answer</summary>
 
-No — and lag will *never* fire for this.
+Metrics use `management.otlp.metrics`, because they are exported through Micrometer's OTLP registry. Traces and logs use `management.opentelemetry`, because they go through the OpenTelemetry SDK.
 
-Dead-lettering a record is, from the source topic's perspective, a completed unit of work. The error handler exhausts retries, the recoverer publishes to `wikimedia-stream.dlt`, and the offset is committed. The consumer has moved past the record. Lag drops. Everything looks perfect.
+Getting it wrong does nothing at all, which is the problem. Spring Boot binds properties it recognises and ignores the rest, so `management.otlp.tracing.export.otlp.endpoint` is not an error. It is a line in your configuration that has no effect, and the symptom is an empty Tempo.
 
-Meanwhile 50 events per second are going into a topic nobody reads, with 30 days before retention deletes them.
-
-You need a separate alert on the DLT itself — its produce rate, or a counter incremented in `DeadLetterPublishingRecoverer`, or a Micrometer counter in the DLT consumer:
-
-```promql
-rate(kafka_topic_partition_current_offset{topic="wikimedia-stream.dlt"}[5m]) > 0
-```
-
-This is Lesson 21's final quiz answer, made concrete. A DLT converts a loud failure into a silent one, and it's your job to make it loud again.
+Two prefixes exist because there are genuinely two export paths in the application. Knowing that is what stops you searching for a property that was never going to exist.
 
 </details>
 
-**4. `docker compose ps` shows 10 healthy services. `docker compose ps -a` shows 11. What's the difference, and why did it hide Bug 3 for so long?**
+**4. Sampling is at 0.1 and your traces look fine. Why is this worse than an empty dashboard?**
 
 <details>
 <summary>Reveal answer</summary>
 
-`ps` lists running containers. `ps -a` includes stopped and exited ones.
+Because an empty dashboard tells you something is broken, and a 90% incomplete one tells you nothing is.
 
-Tempo crashed on startup — a config parse error, immediate exit code 1. It was never running, so it never appeared in `docker compose ps`. The output showed ten services, all healthy, and nothing suggested an eleventh was expected.
+With one trace in ten arriving, dashboards populate, spot checks succeed, and the system appears instrumented. Then you go looking for the specific slow request a user complained about, and it is not there, and you cannot tell whether that is because it was not sampled or because it never happened.
 
-The failure mode is worse than a service being red: the service was *absent*. Nothing to be red. You'd only notice by counting, or by asking Grafana for a trace and getting nothing back — and "no traces" looks a lot like "no traffic."
+The incompleteness is also biased in a way people do not expect. Sampling decisions are made at the start of a trace, so you either get a whole request or none of it. You are not losing 90% of spans evenly, you are losing 90% of stories entirely.
 
-`docker compose logs tempo` had the answer in plain text the whole time. Nobody ran it, because nothing indicated they should.
+Setting it explicitly, at whatever value you have chosen, means the number is a decision rather than a default you never saw.
 
 </details>
 
-**5. `sampling.probability: 1.0` traces every request. Why is that wrong in production, and what breaks if you naively set it to `0.01`?**
+**5. Lag is zero and the pipeline is discarding every record. How does that happen, and what catches it?**
 
 <details>
 <summary>Reveal answer</summary>
 
-At 1.0, every request produces spans that are serialised, exported, ingested, indexed, and stored. On a service handling thousands of requests per second, the tracing pipeline can cost more than the service it observes, and Tempo's storage grows without bound.
+Lesson 21 caused it. When the error handler's recoverer publishes a failed record to the dead-letter topic, the container treats the record as handled and the offset advances.
 
-Naively sampling at 1% breaks the thing you actually wanted traces for: **the rare failure**. Head-based sampling decides at the *start* of a trace, before anything has gone wrong. So the one request in 1,000 that took 30 seconds and threw has a 99% chance of not being recorded. You've kept a representative sample of the boring requests and thrown away the interesting ones.
+So a consumer that fails on every single record still commits every offset, keeps up with the log end, and reports lag of zero. The pipeline is maximally broken and maximally healthy-looking, and lag is structurally incapable of detecting it.
 
-The answer is **tail sampling** in the collector: buffer spans until the trace completes, then keep it if it errored, or exceeded a latency threshold, or — for baseline visibility — with some small probability. You keep every failure and 1% of successes.
+What catches it is the dead-letter topic's own throughput, which is why this lesson graphs it alongside lag. The two signals cover the two shapes: lag catches a consumer that has stopped, and the dead-letter rate catches one that is running and rejecting everything.
 
-There's also a subtlety with Kafka: sampling decisions propagate via the `traceparent` header, so an unsampled producer trace means the consumer's continuation is unsampled too. The decision made at the producer governs the whole pipeline.
+Tagging that counter by the cause class from Lesson 22 tells you which of the two it is before you open a log.
 
 </details>
 
@@ -506,8 +612,12 @@ There's also a subtlety with Kafka: sampling decisions propagate via the `tracep
 
 ## Recap
 
-Three signals over one protocol: metrics to Prometheus, traces to Tempo, logs to Loki, all through the OTel Collector. Consumer lag is the alert that catches every failure mode, because it's measured at the broker rather than in your process — but it goes blind to dead-lettered records and to a group with no members, so alert on those too.
+Metrics are scraped from `/actuator/prometheus`, while traces and logs are pushed over OTLP, because a current value can be sampled and an event cannot. `kafka-exporter` translates broker state into something scrapeable.
 
-And four real bugs, each invisible: a Docker hostname unreachable from the host, traces posted to a query port, a container that exited before it could be asked anything, and a log-export thread that died alone. All four left the application healthy. The only test that would have caught any of them is sending a signal and reading it back.
+Metrics and traces are configuration, with the sampling default of 0.1 as the one trap. Logs need a dependency, an appender in `logback-spring.xml`, a runtime install of the SDK into that appender, and an endpoint. Skip the third and everything works except the exporting.
 
-**Next:** [Lesson 27 — Ops toolbox & production checklist →](27-ops-and-production-checklist.md)
+Two property prefixes exist because there are two export paths, and the wrong one binds to nothing.
+
+All four of this stack's failure modes leave the application healthy, which is why you verified each signal separately rather than trusting one dashboard. And because dead-lettering clears lag, the dead-letter rate is the second alert you cannot do without.
+
+**Next:** [Lesson 27: Ops Toolbox and Production Checklist](27-ops-and-production-checklist.md)

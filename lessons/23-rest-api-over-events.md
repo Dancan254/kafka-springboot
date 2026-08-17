@@ -1,40 +1,40 @@
-# Lesson 23 — A REST API Over Consumed Events
+# Lesson 23: A REST API over Consumed Events
 
-> **Part 5 — Production** · 25 minutes
+> **Part 5: Production**
 
 ---
 
 ## What you'll learn
 
-- Why an entity must never be returned from a controller
-- How to build response DTOs as records, and where the mapping belongs
-- Why `Page<Entity>` is a worse API contract than it looks
-- How to write aggregation queries without `List<Object[]>`
+- Why a JPA entity must not leave the service layer, with the failure modes named
+- How a response DTO differs from a mechanical copy of the entity
+- Why `Page<T>` is a leaky API contract
+- How interface projections replace `Object[]` and unchecked casts
 
 ---
 
 ## Why this matters
 
-You have a database full of Wikimedia edits and no way to read them. Adding a controller is easy. Adding one that doesn't quietly couple your HTTP contract to your JPA schema is the actual lesson.
+Your consumer stores events and nothing reads them. Putting an HTTP API over the table is the obvious next step, and it is also the step where a working pipeline acquires a permanent design mistake.
 
-This is also where the layering rules stop being style advice. A Kafka consumer that leaks its entity to the API means every future migration — renaming a column, adding a lazy association, switching to Avro — becomes a breaking change for clients who were never told they depended on it.
+The mistake is easy to make, invisible in testing, and expensive to reverse: returning the entity. This lesson builds the wrong version first so you can see what it publishes, then refactors it.
 
 ---
 
 ## Before you start
 
-[Lesson 22](22-dlt-headers-and-replay.md). A consumer persisting events to H2.
+[Lesson 22](22-dlt-headers-and-replay.md), with events in the table.
 
-Add the web starter if you haven't:
+Add the web starter to the consumer:
 
 ```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-webmvc</artifactId>
-</dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
 ```
 
-Note the name. In Spring Boot 4 this is `spring-boot-starter-webmvc`, not `spring-boot-starter-web`.
+Note the name. In Spring Boot 4 this is `spring-boot-starter-webmvc`, not `spring-boot-starter-web`. The consumer already had a web server from actuator; this adds Spring MVC to it.
 
 ---
 
@@ -42,21 +42,19 @@ Note the name. In Spring Boot 4 this is `spring-boot-starter-webmvc`, not `sprin
 
 ### Entities stop at the service layer
 
-`WikimediaEvent` is a JPA entity. It is a mutable, Hibernate-managed object with an identity, a persistence context, and a schema.
+`WikimediaEvent` is a JPA entity: a mutable, Hibernate-managed object with an identity, a persistence context and a schema.
 
-Return it from a controller and four things happen, none of them good:
+Return it from a controller and four things happen, none of them good.
 
-**Your column names become your JSON field names.** Rename `editor` to `contributor` in a migration and every API consumer breaks.
+**Your column names become your JSON field names.** Rename `editor` to `contributor` in a migration and every API client breaks, for a change that had nothing to do with them.
 
-**You leak internals.** `id`, `kafkaPartition`, `kafkaOffset` are implementation details of *how* you ingested the event. A client asking for Wikipedia edits does not need your Kafka offsets.
+**You leak internals.** `id`, `kafkaPartition` and `kafkaOffset` are details of how you ingested the event. A client asking for Wikipedia edits does not need your Kafka offsets, and once they can see them somebody will start depending on them.
 
-**Serialization can trigger queries.** With a lazy association, Jackson touching the getter fires a `SELECT` mid-serialization, outside any transaction. This is where `LazyInitializationException` comes from, and where N+1 queries hide.
+**Serialization can trigger queries.** With a lazy association, Jackson touching a getter fires a select mid-serialization, outside any transaction. That is where `LazyInitializationException` comes from, and where N+1 queries hide.
 
-**You cannot evolve them independently.** The whole point of a DTO is that the API contract and the storage schema change for different reasons, on different schedules.
+**You cannot evolve them independently.** The API contract and the storage schema change for different reasons on different schedules, which is the entire argument for a DTO.
 
-So: map to a response DTO before returning. Always.
-
-### Response DTOs are records
+### Response DTOs are records, not copies
 
 ```java
 public record WikimediaEventResponse(
@@ -69,37 +67,31 @@ public record WikimediaEventResponse(
 ) {}
 ```
 
-Immutable, no Lombok, no setters. And notice it is *not* a field-for-field copy of the entity: `username` became `editor`, the epoch-seconds `Long` became an `Instant`, and the Kafka provenance columns are gone entirely.
+Immutable, no Lombok, no setters, following the same rule as the inbound DTO in Lesson 16.
 
-That divergence is the point. If your DTO is a mechanical copy of your entity, you haven't designed an API — you've published your schema with extra steps.
+Notice it is not a field-for-field copy. `username` became `editor`, the epoch-seconds `Long` became an `Instant`, and the Kafka provenance columns are gone entirely.
 
-**Separate request and response DTOs.** This lesson has no request bodies, but the rule holds: never reuse one record for both directions. They validate differently and evolve differently.
+That divergence is the point. If your response DTO is a mechanical copy of your entity, you have not designed an API, you have published your schema with extra steps and taken on the mapping cost anyway.
+
+Keep request and response DTOs separate as a rule, even though this lesson has no request bodies. They validate differently and evolve differently.
 
 ### Where mapping belongs
 
-Not in the controller. The controller handles HTTP: parse the request, call the service, choose a status code.
+Not in the controller, which handles HTTP concerns: parse the request, call the service, choose a status code.
 
-Not in the entity either — an entity that knows how to become a DTO knows about the layer above it.
+Not in the entity either, because an entity that knows how to become a DTO knows about the layer above it.
 
-A static factory on the response record is the smallest thing that works:
+A static factory on the response record is the smallest thing that works, and dependencies point the right way: the record depends on the entity, and the entity knows nothing.
 
-```java
-public record WikimediaEventResponse(...) {
-    public static WikimediaEventResponse from(WikimediaEvent event) { ... }
-}
-```
-
-The record depends on the entity; the entity knows nothing. Dependencies point inward.
-
-> In a larger project this belongs in a dedicated mapper. For a demo, a static factory keeps the indirection down — and the house rule is that a new abstraction needs a reason.
+In a larger codebase this belongs in a dedicated mapper. For a pipeline this size, a static factory keeps the indirection down.
 
 ### `Page<T>` is a leaky contract
 
-`Page<WikimediaEvent>` serialises to JSON containing `content`, `pageable`, `sort`, `numberOfElements`, `first`, `last`, `empty` — Spring Data's internal pagination model, published as your API.
+`Page<WikimediaEvent>` serialises to JSON containing `content`, `pageable`, `sort`, `numberOfElements`, `first`, `last` and `empty`: Spring Data's internal pagination model, published as your API.
 
-It has changed shape across Spring Data versions, and it warns about exactly this at runtime in recent versions. Map to `Page<WikimediaEventResponse>` at minimum; better, return your own small envelope so pagination metadata is a contract you own.
+That shape has changed across Spring Data versions, and recent versions warn about exactly this at runtime. Mapping to `Page<WikimediaEventResponse>` fixes the element type, which is the important half. Returning your own envelope so that pagination metadata is a contract you own is better still.
 
-For this lesson `Page<WikimediaEventResponse>` is enough — the DTO mapping is the point.
+This lesson uses `Page<WikimediaEventResponse>`, because the element mapping is the lesson and the envelope is a follow-on exercise.
 
 ### Aggregations without `Object[]`
 
@@ -110,92 +102,133 @@ The obvious way to count events per wiki:
 List<Object[]> countGroupedByWiki();
 ```
 
-Then in the service:
+and then, in the service, `(String) row[0]` and `(Long) row[1]`.
 
-```java
-row -> (String) row[0], row -> (Long) row[1]
-```
+Two unchecked casts and positional indexing, with nothing checked until runtime. Swap the columns in the query and it compiles, deploys, and throws `ClassCastException` in production.
 
-Two unchecked casts, positional indexing, and nothing catches a mistake until runtime. Swap the columns in the query and it compiles, deploys, and throws `ClassCastException` in production.
-
-Spring Data supports **interface projections**, which give the compiler something to check:
+Spring Data supports interface projections, which give the compiler something to work with:
 
 ```java
 public interface WikiCount {
     String getWiki();
     long getCount();
 }
-
-@Query("SELECT e.wiki AS wiki, COUNT(e) AS count FROM WikimediaEvent e GROUP BY e.wiki ORDER BY COUNT(e) DESC")
-List<WikiCount> countGroupedByWiki();
 ```
 
-The `AS` aliases must match the getter names. Now the mapping is by name, not position.
+The `AS` aliases in the query must match the getter names, so the mapping is by name rather than by position. Rename a column in the query without renaming the getter and you get a failure at startup rather than a wrong cast under load.
 
 ---
 
 ## Hands-on
 
-### 1. Repository query methods
+### 1. Build the wrong version first
+
+This takes two minutes and it is worth doing, because the output is more persuasive than the argument.
 
 ```java
-package com.javaguy.consumer.repository;
+package com.example.wikimedia.consumer.controller;
 
-import com.javaguy.consumer.entity.WikimediaEvent;
+import com.example.wikimedia.consumer.entity.WikimediaEvent;
+import com.example.wikimedia.consumer.repository.WikimediaEventRepository;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-import java.util.List;
+@RestController
+@RequestMapping("/api/v1/wikimedia")
+public class WikimediaEventController {
 
-public interface WikimediaEventRepository extends JpaRepository<WikimediaEvent, Long> {
+    private final WikimediaEventRepository repository;
 
-    Page<WikimediaEvent> findByWiki(String wiki, Pageable pageable);
+    public WikimediaEventController(WikimediaEventRepository repository) {
+        this.repository = repository;
+    }
 
-    Page<WikimediaEvent> findByType(String type, Pageable pageable);
-
-    List<WikimediaEvent> findTop10ByOrderByProcessedAtDesc();
-
-    long countByBot(boolean bot);
-
-    @Query("""
-            SELECT e.wiki AS name, COUNT(e) AS total
-            FROM WikimediaEvent e
-            GROUP BY e.wiki
-            ORDER BY COUNT(e) DESC
-            """)
-    List<NameCount> countGroupedByWiki();
-
-    @Query("""
-            SELECT e.type AS name, COUNT(e) AS total
-            FROM WikimediaEvent e
-            GROUP BY e.type
-            ORDER BY COUNT(e) DESC
-            """)
-    List<NameCount> countGroupedByType();
-
-    /** Interface projection — Spring Data maps by alias name, not column position. */
-    interface NameCount {
-        String getName();
-        long getTotal();
+    @GetMapping("/events")
+    public Page<WikimediaEvent> events(Pageable pageable) {
+        return repository.findAll(pageable);
     }
 }
 ```
 
-The derived query names do real work. `findTop10ByOrderByProcessedAtDesc` needs no `@Query` at all — Spring Data parses the method name into `SELECT ... ORDER BY processed_at DESC LIMIT 10`. That's why the naming convention is worth learning.
+Run it and look at what you just published:
 
-Text blocks for the JPQL, because a one-line `@Query` string with a `GROUP BY` is unreadable.
+```bash
+curl -s 'localhost:8082/api/v1/wikimedia/events?size=1' | head -40
+```
 
-### 2. Response DTOs
+Three things are now part of your public API. Your database column names. Your Kafka partition and offset for every event. And Spring Data's entire pagination envelope, including `pageable`, `sort`, `first`, `last` and `empty`.
+
+You have also skipped the service layer entirely, so there is nowhere for business logic to live when it arrives.
+
+Delete that file. The rest of the lesson builds the version you would keep.
+
+### 2. Repository queries with projections
+
+```java
+package com.example.wikimedia.consumer.repository;
+
+import com.example.wikimedia.consumer.entity.WikimediaEvent;
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.ListCrudRepository;
+import org.springframework.data.repository.PagingAndSortingRepository;
+
+public interface WikimediaEventRepository
+        extends ListCrudRepository<WikimediaEvent, Long>,
+                PagingAndSortingRepository<WikimediaEvent, Long> {
+
+    Page<WikimediaEvent> findByWikiOrderByProcessedAtDesc(String wiki, Pageable pageable);
+
+    Page<WikimediaEvent> findByTypeOrderByProcessedAtDesc(String type, Pageable pageable);
+
+    List<WikimediaEvent> findTop10ByOrderByProcessedAtDesc();
+
+    long countByBotTrue();
+
+    /** Aliases must match the getter names on WikiCount. */
+    @Query("""
+            SELECT e.wiki AS wiki, COUNT(e) AS count
+            FROM WikimediaEvent e
+            GROUP BY e.wiki
+            ORDER BY COUNT(e) DESC
+            """)
+    List<WikiCount> countGroupedByWiki();
+
+    @Query("""
+            SELECT e.type AS type, COUNT(e) AS count
+            FROM WikimediaEvent e
+            GROUP BY e.type
+            ORDER BY COUNT(e) DESC
+            """)
+    List<TypeCount> countGroupedByType();
+
+    interface WikiCount {
+        String getWiki();
+        long getCount();
+    }
+
+    interface TypeCount {
+        String getType();
+        long getCount();
+    }
+}
+```
+
+The derived query names are long and that is deliberate: `findByWikiOrderByProcessedAtDesc` is a specification, and Spring Data fails at startup if it cannot map one to the entity. A misspelling here is a startup error, not a runtime surprise.
+
+### 3. Response DTOs
 
 `dto/WikimediaEventResponse.java`:
 
 ```java
-package com.javaguy.consumer.dto;
+package com.example.wikimedia.consumer.dto;
 
-import com.javaguy.consumer.entity.WikimediaEvent;
-
+import com.example.wikimedia.consumer.entity.WikimediaEvent;
 import java.time.Instant;
 
 public record WikimediaEventResponse(
@@ -204,10 +237,9 @@ public record WikimediaEventResponse(
         String editor,
         boolean bot,
         String wiki,
-        String serverName,
-        Instant occurredAt,
-        String comment
+        Instant occurredAt
 ) {
+
     public static WikimediaEventResponse from(WikimediaEvent event) {
         return new WikimediaEventResponse(
                 event.getType(),
@@ -215,119 +247,49 @@ public record WikimediaEventResponse(
                 event.getUsername(),
                 event.isBot(),
                 event.getWiki(),
-                event.getServerName(),
-                event.getEventTimestamp() == null ? null : Instant.ofEpochSecond(event.getEventTimestamp()),
-                event.getComment()
-        );
+                event.getEventTimestamp() == null
+                        ? null
+                        : Instant.ofEpochSecond(event.getEventTimestamp()));
     }
 }
 ```
 
-`id`, `kafkaPartition`, `kafkaOffset`, and `processedAt` are deliberately absent. They are how the record got here, not what it is.
-
 `dto/EventStatsResponse.java`:
 
 ```java
-package com.javaguy.consumer.dto;
+package com.example.wikimedia.consumer.dto;
 
 import java.util.Map;
 
 public record EventStatsResponse(
-        long totalEvents,
-        long botEdits,
-        long humanEdits,
+        long total,
+        long byBots,
+        long byHumans,
         Map<String, Long> byWiki,
         Map<String, Long> byType
 ) {}
 ```
 
-A record, not `Map<String, Object>`. The response shape is now checked by the compiler and visible in one place.
+Two things the entity has and these do not: the database identity, and the Kafka provenance. Those exist so you can debug ingestion, which is not something an API client does.
 
-### 3. The controller
+### 4. The service layer
 
-```java
-package com.javaguy.consumer.controller;
-
-import com.javaguy.consumer.dto.EventStatsResponse;
-import com.javaguy.consumer.dto.WikimediaEventResponse;
-import com.javaguy.consumer.service.WikimediaEventService;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
-import org.springframework.data.web.PageableDefault;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.List;
-
-@RestController
-@RequestMapping("/api/v1/wikimedia/events")
-public class WikimediaEventController {
-
-    private final WikimediaEventService service;
-
-    public WikimediaEventController(WikimediaEventService service) {
-        this.service = service;
-    }
-
-    @GetMapping
-    public ResponseEntity<Page<WikimediaEventResponse>> getAll(
-            @PageableDefault(size = 20, sort = "processedAt", direction = Sort.Direction.DESC)
-            Pageable pageable) {
-        return ResponseEntity.ok(service.findAll(pageable));
-    }
-
-    @GetMapping("/recent")
-    public ResponseEntity<List<WikimediaEventResponse>> getRecent() {
-        return ResponseEntity.ok(service.findRecent());
-    }
-
-    @GetMapping("/wiki/{wiki}")
-    public ResponseEntity<Page<WikimediaEventResponse>> getByWiki(
-            @PathVariable String wiki,
-            @PageableDefault(size = 20, sort = "processedAt", direction = Sort.Direction.DESC)
-            Pageable pageable) {
-        return ResponseEntity.ok(service.findByWiki(wiki, pageable));
-    }
-
-    @GetMapping("/type/{type}")
-    public ResponseEntity<Page<WikimediaEventResponse>> getByType(
-            @PathVariable String type,
-            @PageableDefault(size = 20, sort = "processedAt", direction = Sort.Direction.DESC)
-            Pageable pageable) {
-        return ResponseEntity.ok(service.findByType(type, pageable));
-    }
-
-    @GetMapping("/stats")
-    public ResponseEntity<EventStatsResponse> getStats() {
-        return ResponseEntity.ok(service.computeStats());
-    }
-}
-```
-
-No Lombok. No repository. No mapping. No try/catch. Explicit `ResponseEntity` with an explicit status. The controller's entire job is HTTP.
-
-### 4. The service
+`service/WikimediaEventService.java`:
 
 ```java
-package com.javaguy.consumer.service;
+package com.example.wikimedia.consumer.service;
 
-import com.javaguy.consumer.dto.EventStatsResponse;
-import com.javaguy.consumer.dto.WikimediaEventResponse;
-import com.javaguy.consumer.repository.WikimediaEventRepository;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
+import com.example.wikimedia.consumer.dto.EventStatsResponse;
+import com.example.wikimedia.consumer.dto.WikimediaEventResponse;
+import com.example.wikimedia.consumer.repository.WikimediaEventRepository;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
-import java.util.stream.Collectors;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @Transactional(readOnly = true)
@@ -343,206 +305,245 @@ public class WikimediaEventService {
         return repository.findAll(pageable).map(WikimediaEventResponse::from);
     }
 
+    public Page<WikimediaEventResponse> findByWiki(String wiki, Pageable pageable) {
+        return repository.findByWikiOrderByProcessedAtDesc(wiki, pageable)
+                .map(WikimediaEventResponse::from);
+    }
+
+    public Page<WikimediaEventResponse> findByType(String type, Pageable pageable) {
+        return repository.findByTypeOrderByProcessedAtDesc(type, pageable)
+                .map(WikimediaEventResponse::from);
+    }
+
     public List<WikimediaEventResponse> findRecent() {
         return repository.findTop10ByOrderByProcessedAtDesc().stream()
                 .map(WikimediaEventResponse::from)
                 .toList();
     }
 
-    public Page<WikimediaEventResponse> findByWiki(String wiki, Pageable pageable) {
-        return repository.findByWiki(wiki, pageable).map(WikimediaEventResponse::from);
-    }
-
-    public Page<WikimediaEventResponse> findByType(String type, Pageable pageable) {
-        return repository.findByType(type, pageable).map(WikimediaEventResponse::from);
-    }
-
-    public EventStatsResponse computeStats() {
+    public EventStatsResponse stats() {
         long total = repository.count();
-        long botEdits = repository.countByBot(true);
+        long bots = repository.countByBotTrue();
 
         return new EventStatsResponse(
                 total,
-                botEdits,
-                total - botEdits,
-                toOrderedMap(repository.countGroupedByWiki()),
-                toOrderedMap(repository.countGroupedByType())
-        );
+                bots,
+                total - bots,
+                toMap(repository.countGroupedByWiki(),
+                        WikimediaEventRepository.WikiCount::getWiki,
+                        WikimediaEventRepository.WikiCount::getCount),
+                toMap(repository.countGroupedByType(),
+                        WikimediaEventRepository.TypeCount::getType,
+                        WikimediaEventRepository.TypeCount::getCount));
     }
 
-    // LinkedHashMap preserves the query's ORDER BY COUNT DESC; toMap() would not.
-    private Map<String, Long> toOrderedMap(List<WikimediaEventRepository.NameCount> rows) {
-        return rows.stream().collect(Collectors.toMap(
-                WikimediaEventRepository.NameCount::getName,
-                WikimediaEventRepository.NameCount::getTotal,
-                (a, b) -> a,
-                LinkedHashMap::new));
+    private <T> Map<String, Long> toMap(List<T> rows,
+                                        Function<T, String> keyFn,
+                                        Function<T, Long> valueFn) {
+        // LinkedHashMap so the ORDER BY in the query survives into the JSON.
+        Map<String, Long> result = new LinkedHashMap<>();
+        for (T row : rows) {
+            result.put(keyFn.apply(row), valueFn.apply(row));
+        }
+        return result;
     }
 }
 ```
 
-`Page.map()` does the DTO conversion while preserving pagination metadata — no manual page arithmetic.
+`@Transactional(readOnly = true)` on the class does two things worth knowing. It keeps the persistence context open for the duration of a method, so mapping happens inside a transaction rather than during serialization, and it tells Hibernate to skip dirty checking, which is real work avoided on a read path.
 
-`@Transactional(readOnly = true)` at the class level. It gives Hibernate permission to skip dirty-checking, and it means `computeStats()`'s three queries see one consistent snapshot rather than three.
+The `LinkedHashMap` matters more than it looks. A `HashMap` would discard the `ORDER BY` from the query, so the busiest wiki would appear in an arbitrary position and the ordering you wrote in JPQL would have no effect on the response.
 
-That `LinkedHashMap` detail matters. Your JPQL says `ORDER BY COUNT(e) DESC`, and `Collectors.toMap()` returns a `HashMap`, which throws that ordering away. The API would return wikis in hash order while the query carefully sorted them. It's the kind of bug that survives code review because both lines look right.
+### 5. The controller
 
-### 5. Run it
+```java
+package com.example.wikimedia.consumer.controller;
 
-```bash
-curl -s 'http://localhost:8082/api/v1/wikimedia/events/recent' | jq '.[0]'
-```
+import com.example.wikimedia.consumer.dto.EventStatsResponse;
+import com.example.wikimedia.consumer.dto.WikimediaEventResponse;
+import com.example.wikimedia.consumer.service.WikimediaEventService;
+import java.util.List;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-```json
-{
-  "type": "edit",
-  "title": "Nikola Tesla",
-  "editor": "Some Contributor",
-  "bot": false,
-  "wiki": "enwiki",
-  "serverName": "en.wikipedia.org",
-  "occurredAt": "2026-07-10T08:41:33Z",
-  "comment": "fixed a typo"
+@RestController
+@RequestMapping("/api/v1/wikimedia")
+public class WikimediaEventController {
+
+    private final WikimediaEventService service;
+
+    public WikimediaEventController(WikimediaEventService service) {
+        this.service = service;
+    }
+
+    @GetMapping("/events")
+    public ResponseEntity<Page<WikimediaEventResponse>> events(
+            @PageableDefault(size = 20, sort = "processedAt") Pageable pageable) {
+        return ResponseEntity.ok(service.findAll(pageable));
+    }
+
+    @GetMapping("/events/recent")
+    public ResponseEntity<List<WikimediaEventResponse>> recent() {
+        return ResponseEntity.ok(service.findRecent());
+    }
+
+    @GetMapping("/events/wiki/{wiki}")
+    public ResponseEntity<Page<WikimediaEventResponse>> byWiki(
+            @PathVariable String wiki,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ResponseEntity.ok(service.findByWiki(wiki, pageable));
+    }
+
+    @GetMapping("/events/type/{type}")
+    public ResponseEntity<Page<WikimediaEventResponse>> byType(
+            @PathVariable String type,
+            @PageableDefault(size = 20) Pageable pageable) {
+        return ResponseEntity.ok(service.findByType(type, pageable));
+    }
+
+    @GetMapping("/events/stats")
+    public ResponseEntity<EventStatsResponse> stats() {
+        return ResponseEntity.ok(service.stats());
+    }
 }
 ```
 
-No `id`. No `kafkaOffset`. An ISO-8601 timestamp instead of epoch seconds.
+`@PageableDefault` sets a bounded page size. Without it a client can request `size=1000000` and your API will attempt it, which is a denial of service you wrote yourself.
+
+No try or catch anywhere. The controller handles HTTP and nothing else.
+
+### 6. Run it and compare
 
 ```bash
-curl -s 'http://localhost:8082/api/v1/wikimedia/events/stats' | jq
-curl -s 'http://localhost:8082/api/v1/wikimedia/events/wiki/enwiki?size=5' | jq '.content | length'
-curl -s 'http://localhost:8082/api/v1/wikimedia/events/type/edit?page=0&size=3' | jq '.totalElements'
+curl -s 'localhost:8082/api/v1/wikimedia/events?size=2' | head -30
+curl -s 'localhost:8082/api/v1/wikimedia/events/recent' | head -20
+curl -s 'localhost:8082/api/v1/wikimedia/events/wiki/enwiki?size=2'
+curl -s 'localhost:8082/api/v1/wikimedia/events/type/edit?size=2'
+curl -s 'localhost:8082/api/v1/wikimedia/events/stats'
 ```
 
-### 6. Compare with the reference implementation
+Compare the `events` output with what step 1 produced. The Kafka provenance is gone, `editor` replaces the column name, and the timestamp is an ISO-8601 instant rather than an epoch integer.
 
-Open `consumer/src/main/java/com/javaguy/consumer/controller/WikimediaEventController.java` in the repository root.
-
-It returns `Page<WikimediaEvent>` — the entity. It carries `@RequiredArgsConstructor` on a controller. It injects the repository directly, skipping the service layer. Its `/stats` returns `Map<String, Object>`, and it casts `Object[]` rows positionally.
-
-It works. It also publishes the JPA schema as an API contract, and its `/stats` map ordering is at the mercy of `HashMap`.
-
-Both versions are in this repository on purpose. The reference implementation is what a lot of real Kafka demos look like; this lesson is what it should look like.
+The envelope is still Spring Data's, which is the remaining leak and the first exercise.
 
 ---
 
 ## Try it yourself
 
-1. Rename the entity field `username` to `contributor` (keep `@Column(name = "editor")`). Which version of the controller breaks its API contract — yours or the reference one? Now do the same to the `@Column` name.
+1. Replace `Page<WikimediaEventResponse>` with your own envelope record carrying `content`, `page`, `size` and `totalElements`. Compare the JSON. Which fields did Spring Data expose that you now do not, and which of them would you have been happy for a client to depend on?
 
-2. Add `@ManyToOne(fetch = LAZY)` to the entity. Call the reference controller's `GET /events`. What exception, and why does the DTO version not have this problem?
+2. Rewrite `countGroupedByWiki` to return `List<Object[]>` and map it with positional casts. Then swap the two columns in the query. Confirm it compiles, deploys, and fails at runtime. This is the failure mode projections exist to prevent.
 
-3. Replace the interface projection with `List<Object[]>` and swap the two `SELECT` columns. Does it compile? When do you find out?
+3. Request `size=100000`. What happens with `@PageableDefault` in place, and what happens without it? Find the property that caps the maximum page size globally.
 
-4. Add a `GET /events/{id}` that returns `404` when the id doesn't exist. Do it with `ProblemDetail` (RFC 9457) and a `@ControllerAdvice`, not a `try/catch` in the controller.
+4. Add a lazy association to the entity, then return the entity directly from a controller method. Trigger the serialization and read the exception. Explain why it occurred during serialization rather than during the query.
 
 ---
 
 ## Common mistakes
 
-**Returning the entity from a controller.**
-Couples your API to your schema, leaks internals, and invites `LazyInitializationException` during serialization.
+**Returning the entity.**
+Your column names, your ingestion internals and your storage schema become your public API.
 
 **Returning `Page<Entity>`.**
-Publishes Spring Data's internal pagination model as your contract. It has changed shape between versions.
+Both problems at once: the leaked element type and Spring Data's internal envelope.
 
-**`Collectors.toMap()` after an `ORDER BY`.**
-`HashMap` discards the ordering you asked the database for. Use `LinkedHashMap`.
-
-**`List<Object[]>` with positional casts.**
-Unchecked, position-dependent, and fails at runtime. Use an interface projection or a DTO projection.
-
-**Lombok on a controller or service.**
-The house rule. Constructor injection you can see beats one you have to infer.
+**Making the response DTO a field-for-field copy.**
+You paid the mapping cost and got none of the decoupling.
 
 **Injecting the repository into the controller.**
-Skips the service layer. Fine until the second caller needs the same logic.
+There is then nowhere for business logic to live, and the first requirement that is not a query forces a rewrite.
 
-**Forgetting `@Transactional(readOnly = true)` on multi-query reads.**
-`computeStats()` runs four queries; without it, they're four separate transactions and the counts can disagree with each other.
+**Using `Object[]` for aggregations.**
+Positional access and unchecked casts, with failures deferred to runtime.
+
+**Returning a `HashMap` for ordered aggregates.**
+The `ORDER BY` in your query is silently discarded.
+
+**Omitting a page-size cap.**
+A client can ask for a million rows and your service will try.
+
+**Reusing one record for requests and responses.**
+They validate and evolve differently, and the shared record ends up wrong for both.
 
 ---
 
 ## Check your understanding
 
-**1. Your controller returns `WikimediaEvent`. A DBA renames the column `editor` to `contributor` and updates `@Column(name = ...)`. Does the API change?**
+**1. Returning `Page<WikimediaEvent>` publishes two separate leaks. Name both.**
 
 <details>
 <summary>Reveal answer</summary>
 
-No — and that's the point of the trap.
+The element type and the envelope.
 
-`@Column(name = "editor")` maps the *database column*. Jackson serialises the **Java field name**, `username`. So renaming the column changes nothing for clients.
+`WikimediaEvent` is the entity, so its field names, its database identity and its Kafka provenance all appear in the JSON. Any schema change becomes a breaking API change.
 
-But rename the **field** from `username` to `contributor` — a refactor an IDE will do silently across the codebase, keeping `@Column` intact — and every API response changes shape. No compiler error, no failing test unless you have one asserting the JSON.
+`Page` is Spring Data's internal pagination model, so `pageable`, `sort`, `first`, `last`, `numberOfElements` and `empty` become part of your contract too. That shape has changed between Spring Data versions, which means a dependency upgrade can break your clients without a single line of your own code changing.
 
-That's the asymmetry. Your API contract is now hostage to a refactoring operation that looks purely internal. A response DTO makes the contract explicit: renaming the entity field forces you to edit `WikimediaEventResponse.from()`, and the API only changes when you change the record.
+Mapping the element type fixes the first. Only your own envelope fixes the second.
 
 </details>
 
-**2. Why is `Collectors.toMap()` wrong here when the query already has `ORDER BY COUNT(e) DESC`?**
+**2. Why does mapping to a DTO inside a `@Transactional(readOnly = true)` service method matter?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because `toMap()` returns a `HashMap`, and `HashMap` has no ordering. It arranges entries by hash bucket.
+Because it decides whether lazy loading happens somewhere you control.
 
-The database did the sorting work — the most active wiki first — and the collector immediately discarded it. The JSON response comes back in an arbitrary order that happens to be stable for a given set of keys, so it looks deterministic in testing and reshuffles the moment the data changes.
+Inside the transaction, the persistence context is open, so touching an association loads it and any resulting query is inside the transaction boundary. If you instead returned entities and let Jackson map them during serialization, the context would already be closed, and the lazy getter would throw `LazyInitializationException` or, worse, silently open a new connection per element.
 
-`Collectors.toMap(keyFn, valueFn, mergeFn, LinkedHashMap::new)` preserves encounter order, which is the query's order.
-
-This is a good example of two correct-looking lines producing a wrong result. Neither the query nor the collector is buggy; the *composition* is.
+`readOnly = true` adds a second benefit: Hibernate skips dirty checking on the loaded entities, which on a page of results is measurable work avoided.
 
 </details>
 
-**3. What's the concrete failure when a controller returns an entity with a lazy association?**
+**3. Interface projections require `AS` aliases matching the getter names. What does that buy over `Object[]`?**
 
 <details>
 <summary>Reveal answer</summary>
 
-`LazyInitializationException`, thrown by Jackson, during response serialization.
+Failure at startup instead of failure in production.
 
-The service method's transaction commits when it returns. The entity leaves the persistence context detached, with its lazy association still an uninitialised proxy. Jackson then walks the object graph to build JSON, calls the getter for that association, and the proxy tries to load it — with no open session to load it from.
+With `Object[]` the mapping is positional and untyped, so `(String) row[0]` compiles regardless of what the query actually selects. Swap the columns and the code still compiles and deploys, then throws `ClassCastException` on the first request.
 
-The failure happens *after* your controller returned successfully, inside the HTTP message converter. The response has already begun streaming, so the client may get a `200` with truncated JSON.
-
-Mapping to a DTO inside the transactional service method eliminates it entirely: you touch what you need while the session is open, and hand back a plain record with no proxies in it.
+With a projection the mapping is by name and the return type is checked. If the alias and the getter disagree, Spring Data cannot satisfy the interface and tells you when the context starts, before any traffic arrives.
 
 </details>
 
-**4. `List<Object[]>` versus an interface projection. Both work. Why does the interface version prevent a class of bug?**
+**4. Your response DTO renames `username` to `editor` and drops `kafkaOffset`. Is that gratuitous churn?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because the mapping is by **name**, not by **position**.
+No, both changes are the DTO doing its job.
 
-With `Object[]`, `row[0]` is whatever the first `SELECT` expression happened to be, cast to whatever you claim it is. Reorder the `SELECT` clause — a harmless-looking edit — and `(String) row[0]` becomes a `ClassCastException` at runtime, in production, on the first request that hits the endpoint.
+`username` is named for the column, and the column is named `editor` because `user` is a reserved SQL keyword, as Lesson 18 explained. That is a storage constraint leaking into a Java field name, and there is no reason for an API client to inherit it.
 
-With `interface NameCount { String getName(); long getTotal(); }` and `SELECT e.wiki AS name, COUNT(e) AS total`, Spring Data binds by alias. Reordering the `SELECT` changes nothing. Removing an alias fails fast at startup when the projection can't be satisfied.
+`kafkaOffset` exists so you can find the record that produced a row. It is an ingestion detail, and publishing it invites clients to depend on it, at which point changing your ingestion becomes a breaking API change.
 
-You've moved the failure from "runtime, on user traffic" to "compile time or context startup." That's the whole trade.
+If the DTO had been a mechanical copy, both of those would have become permanent parts of your contract by accident rather than by decision.
 
 </details>
 
-**5. The reference controller in this repo injects the repository directly and returns entities. It has worked in production-style demos for years. What is the actual, concrete cost?**
+**5. Step 1 injected the repository straight into the controller and worked fine. What breaks first as the API grows?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The cost is deferred, not absent, and it lands all at once.
+The first requirement that is not a query.
 
-The API contract is *implicit* — defined by whatever fields the entity currently has. Nobody wrote it down, no test asserts it, and every client has quietly come to depend on `id` and `kafkaOffset` being present. Now:
+As long as every endpoint is a thin passthrough, the service layer looks like ceremony. Then something arrives that is genuinely logic: statistics combining several queries, a rule about which events are visible, a computed field, a cache. It has to live somewhere, and the only two options left are the controller, which then knows about business rules and HTTP, or the repository, which then knows about business rules and persistence.
 
-- Adding a column adds a field to every response. Probably harmless, occasionally not.
-- Renaming a field is a breaking change disguised as a refactor.
-- Adding a lazy association breaks serialization.
-- Switching the entity to Avro-generated classes (Lesson 25) means the API changes shape.
-- You cannot version the API independently of the schema, because they're the same thing.
+The `stats()` method in this lesson is exactly that case. It performs four queries and combines them, and it needs ordering preserved into a map. In a controller that would be HTTP handling mixed with aggregation logic, untestable without a web context.
 
-None of this hurts while the schema is stable and there's one client. All of it hurts on the day you need to change the schema, which is the day you can least afford a coordinated client migration.
-
-The DTO is insurance with a small, constant premium.
+Adding the layer up front costs one file. Adding it later costs a rewrite of every endpoint that grew around its absence.
 
 </details>
 
@@ -550,8 +551,10 @@ The DTO is insurance with a small, constant premium.
 
 ## Recap
 
-Entities stop at the service layer. Response DTOs are records, deliberately *not* mirrors of the entity — no `id`, no Kafka offsets, an `Instant` instead of epoch seconds. Controllers return `ResponseEntity` and do nothing but HTTP. Aggregations use interface projections so the compiler checks the mapping, and `LinkedHashMap` so the database's `ORDER BY` survives contact with the collector.
+Entities stop at the service layer, because returning them publishes your column names, your ingestion internals and your storage schema as an API contract. You built that version first and looked at the JSON, then replaced it with response DTOs that deliberately diverge from the entity.
 
-Your pipeline now ingests, persists, and serves. None of it is tested.
+`Page<T>` leaks Spring Data's pagination model, and mapping the element type fixes only half of it. Interface projections replace `Object[]` and move aggregation mistakes from production to startup.
 
-**Next:** [Lesson 24 — Testing Kafka with Testcontainers →](24-testing-with-testcontainers.md)
+The controller handles HTTP, the service owns logic and transactions, and the repository is an interface.
+
+**Next:** [Lesson 24: Testing Kafka with Testcontainers](24-testing-with-testcontainers.md)

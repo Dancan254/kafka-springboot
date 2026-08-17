@@ -1,33 +1,31 @@
-# Lesson 16 — DTO Records & Deserialization
+# Lesson 16: DTO Records and Deserialization
 
-> **Part 3 — The Consumer** · 20 minutes
+> **Part 3: The Consumer**
 
 ---
 
 ## What you'll learn
 
-- Why a Java `record` is the right shape for an inbound event
-- How `@JsonIgnoreProperties(ignoreUnknown = true)` protects you from the producer's schema changes
-- Why Spring Boot 4 ships Jackson 3, and what that changes
-- Why parsing *inside* the listener beats configuring a `JsonDeserializer`
+- Why you should bind only the fields you need from a payload you do not own
+- Why an inbound event is a `record` rather than a class
+- What Jackson 3 changed in Spring Boot 4, and what it did not
+- Why parsing inside the listener beats configuring a JSON deserializer
 
 ---
 
 ## Why this matters
 
-The consumer currently logs `valueLength=1834`. Inside that string is a Wikimedia event with about forty fields, of which you want nine.
+Your consumer logs the length of a string. That is not processing, it is proof of delivery.
 
-How you turn that string into an object determines what happens when the string is malformed — and malformed input is guaranteed, eventually. The choice you make here decides whether a single bad record kills your consumer, blocks a partition forever, or gets quietly diverted for inspection.
-
-That decision is the seed of Part 4.
+Turning the payload into a typed object is where the interesting decisions live, and most of them are about coupling. You are consuming a schema owned by someone else, who can change it without telling you, and the choices in this lesson decide whether that breaks you.
 
 ---
 
 ## Before you start
 
-[Lesson 15](15-first-kafkalistener.md). A consumer that logs records.
+[Lesson 15](15-first-kafkalistener.md), with a consumer that logs records.
 
-Look at the actual payload first:
+Look at the payload before modelling it:
 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
@@ -35,7 +33,7 @@ docker exec kafka-1 kafka-console-consumer \
   --topic wikimedia-stream --max-messages 1
 ```
 
-A large JSON document: `$schema`, `meta`, `id`, `type`, `namespace`, `title`, `comment`, `timestamp`, `user`, `bot`, `server_name`, `wiki`, and more.
+A large JSON document containing `$schema`, `meta`, `id`, `type`, `namespace`, `title`, `comment`, `timestamp`, `user`, `bot`, `server_name`, `wiki` and more.
 
 ---
 
@@ -43,96 +41,72 @@ A large JSON document: `$schema`, `meta`, `id`, `type`, `namespace`, `title`, `c
 
 ### Take only what you need
 
-You could map all forty fields. Don't.
+You could map all forty fields. Do not.
 
-Every field you bind is a field you have coupled yourself to. Wikimedia can add, rename, or remove fields at any time — you don't control their schema. Bind nine, ignore the rest, and their changes cannot break you unless they touch the nine.
+Every field you bind is a field you have coupled yourself to. Wikimedia can add, rename or remove fields at any time, and you do not control their schema. Bind nine, ignore the rest, and their changes cannot break you unless they touch one of your nine.
 
 ```java
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record WikimediaEventDto(...) {}
 ```
 
-Without `ignoreUnknown = true`, Jackson throws `UnrecognizedPropertyException` on the first unmapped field. With it, unmapped fields are silently discarded. For a payload you don't own, this is not laziness — it's the only sane default.
+Without `ignoreUnknown = true`, Jackson fails on the first unmapped field. With it, unmapped fields are discarded. For a payload you do not own, this is not laziness. It is the only sane default.
 
 ### Records, not classes
 
-An inbound event is immutable data. It has no behaviour, no lifecycle, no identity. That is precisely what a `record` is for:
+An inbound event is immutable data with no behaviour, lifecycle or identity, which is exactly what a `record` is for. You get a constructor, accessors, `equals`, `hashCode` and `toString`, and you cannot accidentally mutate an event halfway through processing.
 
-```java
-public record WikimediaEventDto(String type, String title, ...) {}
-```
+Jackson binds to records natively, using the canonical constructor, so there is no no-argument constructor and no setters to expose.
 
-You get a constructor, accessors, `equals`, `hashCode`, and `toString` — and, more importantly, you cannot accidentally mutate an event halfway through processing.
+> This is also why this course puts no Lombok on DTOs. `@Data` on a class gives you a mutable object with setters, which is the opposite of what an event should be. Records make Lombok unnecessary here. Lesson 18 is where Lombok earns its place.
 
-Jackson binds to records natively. It uses the canonical constructor, so there's no no-args constructor and no setters to expose.
+### Field names that do not match
 
-> This is also why the house convention is **no Lombok on DTOs**. `@Data` on a class gives you a mutable object with setters, which is the opposite of what an event should be. Records make Lombok unnecessary here.
-
-### Field names that don't match
-
-Wikimedia sends `server_name`. Java wants `serverName`.
+Wikimedia sends `server_name` and Java wants `serverName`:
 
 ```java
 @JsonProperty("server_name") String serverName
 ```
 
-You could instead configure a global `SNAKE_CASE` naming strategy, but that applies to every type in the application and couples your whole codebase to one external system's convention. An annotation on the one field that differs is more honest.
+You could configure a global snake-case naming strategy instead, but that applies to every type in the application and couples your whole codebase to one external system's convention. An annotation on the single field that differs is more honest.
 
-### Jackson 3 — a Spring Boot 4 surprise
+### Jackson 3, a Spring Boot 4 surprise
 
-Spring Boot 4 ships **Jackson 3**, and Jackson 3 changed its package names:
+Spring Boot 4 ships Jackson 3, which changed its package names:
 
 | | Jackson 2 | Jackson 3 |
 |---|---|---|
-| `ObjectMapper` | `com.fasterxml.jackson.databind` | **`tools.jackson.databind`** |
-| Core exception | `com.fasterxml.jackson.core.JsonProcessingException` | **`tools.jackson.core.JacksonException`** |
-| Annotations | `com.fasterxml.jackson.annotation` | **unchanged** |
+| `ObjectMapper` | `com.fasterxml.jackson.databind` | `tools.jackson.databind` |
+| Core exception | `com.fasterxml.jackson.core.JsonProcessingException` | `tools.jackson.core.JacksonException` |
+| Annotations | `com.fasterxml.jackson.annotation` | unchanged |
 
 Two things follow.
 
-**The annotations still import from `com.fasterxml.jackson.annotation`.** `@JsonProperty` and `@JsonIgnoreProperties` live in `jackson-annotations`, which kept its coordinates. So a DTO written for Jackson 2 needs no changes.
+**The annotations still import from `com.fasterxml.jackson.annotation`.** `@JsonProperty` and `@JsonIgnoreProperties` live in `jackson-annotations`, which kept its coordinates, so a DTO written for Jackson 2 needs no changes at all. This is confusing the first time: one file with imports from two different roots, both correct.
 
-**`JsonProcessingException` is gone.** In Jackson 3, `JacksonException` extends `RuntimeException` — parsing failures are *unchecked*. Code that used to `catch (JsonProcessingException e)` no longer compiles, and code that didn't catch anything now compiles but throws at runtime.
+**`JsonProcessingException` is gone.** In Jackson 3, `JacksonException` extends `RuntimeException`, so parsing failures are unchecked. Code that used to `catch (JsonProcessingException e)` no longer compiles, and code that caught nothing now compiles and throws at runtime.
 
-You also need the dependency explicitly. In Spring Boot 4, Jackson is **not** transitively pulled in by the web starter:
+You also need the dependency explicitly, because Boot 4 splits Jackson into its own starter rather than pulling it in through the Kafka starter. You added it to the producer in Lesson 14 for the same reason.
 
-```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-jackson</artifactId>
-</dependency>
-```
+### Where to deserialize
 
-This is what provides the auto-configured `ObjectMapper` bean you'll inject.
+There are two places, and the choice matters more than it looks.
 
-### Where to deserialize: two options
-
-**Option A — configure Kafka's `JsonDeserializer`:**
+**Option A, configure Kafka's `JsonDeserializer`:**
 
 ```yaml
 value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
 ```
 
-The record arrives as a `WikimediaEventDto` directly. Clean, and wrong for our purposes.
+The record arrives as a `WikimediaEventDto` directly. Clean, and wrong for this pipeline.
 
-Deserialization now happens *before* your listener is invoked — inside the Kafka client. A malformed record throws a `SerializationException` that your listener never sees, and which the default error handler cannot route anywhere sensible. Handling it needs an `ErrorHandlingDeserializer` wrapper, which adds a layer of indirection precisely where you want clarity.
+Deserialization now happens before your listener is invoked, inside the Kafka client. A malformed record throws a `SerializationException` your listener never sees, and which the error handler in Lesson 20 cannot route usefully. Handling it requires wrapping in an `ErrorHandlingDeserializer`, which adds indirection exactly where you want clarity.
 
-Worse, the record's raw bytes are gone. When you later want to inspect the bad payload, you have a stack trace and no data.
+Worse, the raw bytes are gone by the time you learn there was a problem. When you later want to inspect the bad payload, you have a stack trace and no data.
 
-**Option B — take the `String`, parse it yourself:**
+**Option B, keep `StringDeserializer` and parse in the listener.** The raw JSON is a `String` you still hold, so a parse failure is an ordinary exception thrown from your own code, with the partition, offset and payload all in scope. That is what makes the dead-letter topic in Lesson 21 useful rather than merely tidy.
 
-```java
-public void consume(ConsumerRecord<String, String> record) {
-    WikimediaEventDto dto = parse(record);
-    ...
-}
-```
-
-Deserialization is now ordinary application code inside your listener. You can catch the failure, wrap it in an exception type of your choosing, log the raw payload, and decide exactly what happens next.
-
-That last point is the whole reason. In Lesson 20 you'll configure an error handler that treats some exceptions as retryable and some as fatal. A malformed JSON document will *never* parse, no matter how many times you retry it — so it should skip retries entirely and go straight to the dead-letter topic.
-
-To express that, you need to control the exception type. Option A doesn't let you.
+This course uses option B throughout. Option A is a reasonable choice for internal topics whose schema you own and where a malformed record indicates a bug rather than an expected event.
 
 ---
 
@@ -140,26 +114,26 @@ To express that, you need to control the exception type. Option A doesn't let yo
 
 ### 1. Add Jackson
 
-`pom.xml`:
-
 ```xml
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-jackson</artifactId>
-</dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jackson</artifactId>
+        </dependency>
 ```
+
+This provides the auto-configured `ObjectMapper` bean you are about to inject.
 
 ### 2. `dto/WikimediaEventDto.java`
 
 ```java
-package com.javaguy.consumer.dto;
+package com.example.wikimedia.consumer.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
- * Maps only the fields we care about. Unrecognised fields are discarded, so
- * Wikimedia can evolve its payload without breaking this consumer.
+ * Maps only the fields this consumer uses. Unrecognised fields are discarded so
+ * that Wikimedia can evolve its payload without breaking us.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record WikimediaEventDto(
@@ -175,14 +149,14 @@ public record WikimediaEventDto(
 ) {}
 ```
 
-Nine fields out of forty. `namespace` and `timestamp` are boxed because Wikimedia may omit them; `bot` is a primitive because it's always present.
+Nine fields out of roughly forty. `namespace` and `timestamp` are boxed because Wikimedia may omit them, and `bot` is a primitive because it is always present. That distinction is worth making deliberately: a primitive silently becomes `false` when the field is absent, which is a lie if absence meant "unknown".
 
 ### 3. Parse inside the listener
 
 ```java
-package com.javaguy.consumer.consumer;
+package com.example.wikimedia.consumer.kafka;
 
-import com.javaguy.consumer.dto.WikimediaEventDto;
+import com.example.wikimedia.consumer.dto.WikimediaEventDto;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -207,17 +181,17 @@ public class WikimediaConsumer {
             groupId = "wikimedia-consumer-group"
     )
     public void consume(ConsumerRecord<String, String> record) {
-        WikimediaEventDto dto = parse(record);
+        WikimediaEventDto event = parse(record);
 
-        log.info("Consumed | partition={} offset={} type={} wiki={} title='{}'",
-                record.partition(), record.offset(), dto.type(), dto.wiki(), dto.title());
+        log.info("Consumed partition={} offset={} type={} wiki={} title='{}'",
+                record.partition(), record.offset(), event.type(), event.wiki(), event.title());
     }
 
     private WikimediaEventDto parse(ConsumerRecord<String, String> record) {
         try {
             return objectMapper.readValue(record.value(), WikimediaEventDto.class);
         } catch (JacksonException e) {
-            // Malformed JSON will never parse, no matter how many times we retry.
+            // Malformed JSON will never parse, however many times it is retried.
             // IllegalArgumentException is registered as non-retryable in Lesson 20,
             // so this record skips backoff and goes straight to the dead-letter topic.
             throw new IllegalArgumentException(
@@ -228,15 +202,15 @@ public class WikimediaConsumer {
 }
 ```
 
-Read that catch block carefully. It is doing three things:
+That catch block is doing three things worth naming.
 
-**It converts an unchecked exception into a *meaningful* unchecked exception.** `JacksonException` says "the JSON was bad." `IllegalArgumentException` says "this record's argument is invalid and will always be invalid."
+**It converts an unchecked exception into a meaningful one.** `JacksonException` says the JSON was bad. `IllegalArgumentException` says this record's content is invalid and always will be, which is a statement about retry policy rather than about parsing.
 
-**It records where the bad record lives** — partition and offset — in the message. When you find this in a log at 3 a.m., that's how you fetch the payload.
+**It records where the bad record lives.** Partition and offset in the message are how you fetch the payload later.
 
-**It chains the cause** with `, e`. Never swallow the original.
+**It chains the cause.** Never discard the original.
 
-This exception type is a promise you'll keep in Lesson 20. Nothing enforces it yet; a malformed record right now would be retried forever by the default error handler.
+This exception type is a promise you keep in Lesson 20. Nothing enforces it yet, so a malformed record right now would be retried indefinitely by the default error handler, which step 5 demonstrates.
 
 ### 4. Run it
 
@@ -245,12 +219,12 @@ This exception type is a promise you'll keep in Lesson 20. Nothing enforces it y
 ```
 
 ```
-Consumed | partition=0 offset=483 type=edit wiki=commonswiki title='File:Prigioni cella.JPG'
-Consumed | partition=2 offset=257 type=edit wiki=wikidatawiki title='Q15440113'
-Consumed | partition=1 offset=690 type=categorize wiki=enwiki title='Category:Living people'
+Consumed partition=0 offset=483 type=edit wiki=commonswiki title='File:Prigioni cella.JPG'
+Consumed partition=2 offset=257 type=edit wiki=wikidatawiki title='Q15440113'
+Consumed partition=1 offset=690 type=categorize wiki=enwiki title='Category:Living people'
 ```
 
-Structured fields instead of a string length. And the `type` column shows the four event kinds — `edit`, `new`, `log`, `categorize`.
+Structured fields instead of a string length, and the `type` column shows the four event kinds the feed emits: `edit`, `new`, `log` and `categorize`.
 
 ### 5. Feed it garbage
 
@@ -261,131 +235,129 @@ echo 'this is not json' | docker exec -i kafka-1 kafka-console-producer \
   --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
 
-Watch the consumer. It throws `IllegalArgumentException`, and then — because there's no error handler configured yet — Spring's default retries it, forever, roughly ten times a second.
+Watch the consumer log. You will see the same `IllegalArgumentException` reported over and over, because the default error handler retries and the record can never succeed.
 
-**The partition is now blocked.** The consumer cannot advance past this record, so every valid record behind it on that partition waits. One bad byte has stopped a third of your pipeline.
+Worse, the consumer is now stuck on that offset. Records behind it on the same partition are not being processed, and the group's lag for that partition grows without limit.
 
-Stop the consumer before your disk fills with logs. Skip the poison record by moving the group forward:
+This is a **poison pill**, and it is the single most common way a Kafka consumer stops working in production. Nothing crashed, the process is healthy, the other partitions are fine, and one partition is frozen forever.
+
+Lessons 20, 21 and 22 exist to fix exactly this. For now, get unstuck by skipping the record:
 
 ```bash
 docker exec kafka-1 kafka-consumer-groups \
   --bootstrap-server kafka-1:29092 \
-  --group wikimedia-consumer-group --topic wikimedia-stream \
-  --reset-offsets --to-latest --execute
+  --group wikimedia-consumer-group \
+  --topic wikimedia-stream \
+  --reset-offsets --shift-by 1 --execute
 ```
 
-That's Lesson 05's offset reset, used in anger. It works, and it's a terrible long-term answer — you just skipped *every* pending record on every partition to get past one.
+Stop the consumer before running that, since Lesson 05 showed a group must have no active members to be reset. Then start it again.
 
-Fixing this properly is Part 4.
+Note what you just did in production terms: you skipped a record without knowing what was in it. That is the manual version of a dead-letter topic, and it is why the automated version is worth building.
 
 ---
 
 ## Try it yourself
 
-1. Remove `ignoreUnknown = true` and restart. Which exception, and on which field? Now consider: Wikimedia adds a field next Tuesday. What breaks, and when do you find out?
+1. Add a field to the DTO that Wikimedia does not send, such as `String nonexistent`. Run it. Does anything fail? Now remove `@JsonIgnoreProperties` and run again. Which of the two directions of schema mismatch does that annotation protect you from?
 
-2. Change `boolean bot` to `Boolean bot` and produce a record with `"bot": null`. Then change it back and produce the same record. Which version throws, and what does that tell you about primitives in DTOs?
+2. Change `boolean bot` to `Boolean bot` and produce a record with the `bot` field missing. Compare the parsed value in each case, and decide which is correct for a field that means "was this edit automated".
 
-3. Switch to Option A — set `value-deserializer` to Spring's `JsonDeserializer` with `spring.json.value.default.type`. Produce a malformed record. Where does the exception surface now, and can your listener see the raw bytes?
+3. Switch to option A by setting `value-deserializer` to Spring's `JsonDeserializer` with the appropriate trusted-packages property, then repeat step 5's garbage record. Where does the exception surface now, and what can you still learn about the bad payload?
+
+4. Wikimedia nests useful data under `meta`, including `domain` and `uri`. Add a nested record for it and bind two of those fields. Then explain what your consumer is now coupled to that it was not before.
 
 ---
 
 ## Common mistakes
 
-**Importing `com.fasterxml.jackson.databind.ObjectMapper` under Spring Boot 4.**
-That's Jackson 2. Boot 4 ships Jackson 3: `tools.jackson.databind.ObjectMapper`. The annotations, confusingly, stay on `com.fasterxml`.
+**Binding every field in a payload you do not own.**
+Every bound field is a coupling. Bind what you use.
+
+**Omitting `ignoreUnknown = true` on an external payload.**
+The first field the publisher adds breaks your consumer, and it will be their routine Tuesday.
+
+**Using Lombok `@Data` for an event.**
+You get mutability and setters on something that should be immutable. Use a record.
+
+**Importing `tools.jackson.annotation`.**
+The annotations did not move. Only `ObjectMapper` and the exceptions did.
 
 **Catching `JsonProcessingException`.**
-It doesn't exist in Jackson 3. Catch `JacksonException`, which is unchecked — so nothing forces you to catch it at all.
+It no longer exists in Jackson 3. `JacksonException` is unchecked, so nothing forces you to handle it and nothing warns you that you have not.
 
-**Omitting `ignoreUnknown = true` on an externally-owned payload.**
-Every new field the producer adds becomes an outage for you.
+**Letting a parse failure escape without context.**
+Without the partition and offset in the message, you cannot find the record that caused it.
 
-**Constructing a `new ObjectMapper()` in your service.**
-Inject the auto-configured bean. Yours won't have Boot's modules, date handling, or configuration, and you'll create one per instance.
-
-**Letting a `JacksonException` propagate unwrapped.**
-Its type tells the error handler nothing about whether retrying is useful. Wrap it in something that means "never retry this."
-
-**Using Lombok `@Data` on a DTO.**
-Gives you a mutable event with setters. Use a record.
+**Assuming a poison pill is loud.**
+The process stays healthy and only one partition stops. Lag on that partition is the only signal.
 
 ---
 
 ## Check your understanding
 
-**1. Why does `@JsonIgnoreProperties(ignoreUnknown = true)` matter more for a Kafka consumer than for a REST controller handling your own API?**
+**1. Wikimedia adds a new field to its payload tomorrow. Does your consumer break?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because of who controls the schema, and when you find out it changed.
+No, because of `@JsonIgnoreProperties(ignoreUnknown = true)`. Unmapped fields are discarded.
 
-In your own REST API, request and response types are versioned together and deployed together. In Kafka, the producer is a separate service — here, a separate *organisation* — that can add a field at any moment. The topic may also hold seven days of records written by three different producer versions.
+Without it, Jackson would treat an unrecognised property as an error and every record would fail to parse, which on a feed you do not control is a self-inflicted outage triggered by someone else's routine change.
 
-Without `ignoreUnknown`, the first record containing a new field throws `UnrecognizedPropertyException` on the consumer, which retries it, which blocks the partition. A field addition — the most backwards-compatible change there is — becomes an outage.
-
-Consumers must tolerate fields they don't know about. That's the same principle Schema Registry enforces formally in Lesson 25.
+The direction that would still break you is a field you *do* bind being removed or changed in type. That is the coupling you accepted deliberately, and it is why the DTO binds nine fields rather than forty.
 
 </details>
 
-**2. Why wrap `JacksonException` in `IllegalArgumentException` rather than just letting it propagate?**
+**2. Why parse inside the listener rather than configure a `JsonDeserializer`?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because the exception *type* is the signal your error handler will use to decide whether retrying makes sense.
+Because it keeps the failure inside your own code, where the raw payload still exists.
 
-In Lesson 20 you'll register `IllegalArgumentException` as non-retryable. A record that can't be parsed will never parse — the bytes don't change between attempts — so retrying is pure waste that blocks the partition for the duration of the backoff.
+With a configured deserializer, a malformed record fails inside the Kafka client before your method is called. You get a `SerializationException` with no access to the record, the error handler cannot treat it like an application exception, and routing it to a dead-letter topic requires an `ErrorHandlingDeserializer` wrapper.
 
-`JacksonException` alone doesn't carry that meaning: Spring's error handler has no opinion about it and would apply the default retry policy. By translating "the JSON is bad" into "this argument is permanently invalid," you make a routing decision explicit in the type system.
-
-The wrapping also lets you attach the partition and offset, and preserve the original cause.
+Parsing in the listener means a bad record is an ordinary exception thrown from your code, with the partition, offset and full JSON in scope. That is what makes Lesson 21's dead-letter topic contain something worth reading.
 
 </details>
 
-**3. Spring Boot 4 changed `ObjectMapper` to `tools.jackson.databind` but left `@JsonProperty` on `com.fasterxml.jackson.annotation`. Why the split?**
+**3. Step 5 produced one bad record and the consumer stopped making progress on that partition. Why did the other partitions keep working?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because the *annotations* are a stable, widely-depended-upon API, while the databind implementation had breaking changes to make.
+Because offsets and ordering are per partition, and so is being stuck.
 
-Jackson 3 changed package names to allow it to coexist with Jackson 2 on the same classpath — essential during migration, when some libraries you depend on still use Jackson 2. If the annotations had also moved, every annotated DTO in the ecosystem would need editing, and a class annotated for Jackson 2 could not be read by Jackson 3.
+The container cannot advance past a record that keeps failing, since committing a later offset would mean silently accepting that the record was skipped. So that partition's position stays where it is while the record is retried.
 
-Keeping `jackson-annotations` on its old coordinates means DTOs are source-compatible across both majors. Only code touching `ObjectMapper` and the exception hierarchy needs to change — which, in this project, is exactly one method.
+The other partitions have their own positions and are unaffected, which is exactly what makes this failure hard to notice. Total throughput drops by roughly a third, the process is healthy, no listener has crashed, and only per-partition lag reveals it.
 
 </details>
 
-**4. You produce `this is not json` to the topic. Your consumer has no error handler. Describe precisely what happens to the other records on that partition.**
+**4. `boolean bot` is a primitive. What happens if the field is absent from a record?**
 
 <details>
 <summary>Reveal answer</summary>
 
-They stop being processed, indefinitely.
+It becomes `false`, silently, because that is the default value of a primitive `boolean`.
 
-The listener throws, so the offset is never committed. Spring's default error handler retries the same record — by seeking back to it and re-polling — many times per second. Since the record cannot parse, every attempt fails identically.
+If absence genuinely means "not a bot" that is fine. If absence means "we do not know", you have just converted missing data into a confident negative, and every downstream count of human versus automated edits is quietly wrong.
 
-The consumer never advances past that offset, so **every valid record behind it on the same partition is never delivered.** With 3 partitions, one poison message stops a third of your throughput and lag on that partition grows without bound.
-
-The other two partitions are unaffected — they're independent logs with independent offsets, likely handled by different consumer threads.
-
-This is called a *poison pill*, and it's the single best argument for a dead-letter topic.
+`Boolean` would give you `null` instead, forcing the ambiguity to be handled rather than assumed. Choosing between them is a modelling decision about what absence means, not a style preference.
 
 </details>
 
-**5. Configuring Kafka's `JsonDeserializer` produces cleaner listener code. Name the specific capability you give up.**
+**5. Your parse failure throws `IllegalArgumentException` rather than letting `JacksonException` propagate. What does that buy you, given that neither is checked?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Access to the raw bytes at the moment of failure, and control over the exception type.
+It states a retry policy in the type system, which is what Lesson 20 will read.
 
-With `JsonDeserializer`, deserialization happens inside the Kafka consumer client, *before* the listener container invokes your method. A malformed record throws `SerializationException` from within `poll()` itself. Your listener is never called, so you cannot catch it there, cannot log the offending payload, and cannot choose an exception type that means "don't retry."
+`JacksonException` describes a cause: the bytes were not valid JSON. `IllegalArgumentException` describes a consequence: this input is invalid and will be invalid on every attempt. The error handler in Lesson 20 classifies exceptions into retryable and not, and this is how you tell it which bucket this failure belongs in.
 
-Recovering requires wrapping it in `ErrorHandlingDeserializer`, which catches the failure and passes a special marker to the error handler — workable, but an extra layer, and the original payload still has to be dug out of a header.
-
-Taking the `String` and parsing it yourself keeps failure inside ordinary application code, where exceptions are yours to name.
+It also gives you a message you control, carrying the partition and offset, and it keeps the original as the cause so nothing is lost. Letting the raw Jackson exception escape would work, but it would leave the retry decision to whatever the framework guesses.
 
 </details>
 
@@ -393,10 +365,10 @@ Taking the `String` and parsing it yourself keeps failure inside ordinary applic
 
 ## Recap
 
-An immutable `record`, nine fields out of forty, `ignoreUnknown = true` so the producer can evolve freely. Parsing happens inside the listener — not in a configured deserializer — so that a malformed record produces an exception *you* chose, carrying the partition and offset, ready for an error handler that knows retrying it is pointless.
+You bound nine fields of a forty-field payload into an immutable record, ignoring the rest so the publisher can evolve their schema without breaking you. Jackson 3 moved `ObjectMapper` to `tools.jackson` and made its exceptions unchecked, while leaving the annotations where they were.
 
-You also proved what happens without that error handler: one bad record blocks a partition forever.
+You parse inside the listener so that a bad record is your exception, with the payload still in hand, and you translate it into an exception type that states a retry policy.
 
-Before fixing that, there's a more fundamental problem. Your consumer is committing offsets automatically, on a timer, whether or not it actually did anything with the record.
+Then you produced a poison pill and watched one partition stop forever, which is the problem Part 4 solves.
 
-**Next:** [Lesson 17 — Manual acknowledgment →](17-manual-acknowledgment.md)
+**Next:** [Lesson 17: Manual Acknowledgment](17-manual-acknowledgment.md)

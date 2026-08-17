@@ -112,7 +112,7 @@ Now add two more services. They are `kafka-1` with three values changed each tim
 
 ```yaml
   kafka-2:
-    image: confluentinc/cp-kafka:8.2.2
+    image: confluentinc/cp-kafka:8.3.1
     hostname: kafka-2
     container_name: kafka-2
     ports:
@@ -149,7 +149,7 @@ Now add two more services. They are `kafka-1` with three values changed each tim
       start_period: 20s
 
   kafka-3:
-    image: confluentinc/cp-kafka:8.2.2
+    image: confluentinc/cp-kafka:8.3.1
     hostname: kafka-3
     container_name: kafka-3
     ports:
@@ -365,7 +365,7 @@ lessons-isr:0:1
 
 One record, acknowledged by three replicas.
 
-> Older material passes producer settings as `--producer-property`. That still works in Kafka 4.2 but warns that it is deprecated in favour of `--command-property`.
+> Older material passes producer settings as `--producer-property`. That still works in Kafka 4.x but warns that it is deprecated in favour of `--command-property`.
 
 ### 8. Kill a broker
 

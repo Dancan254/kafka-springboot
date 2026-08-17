@@ -1,115 +1,121 @@
-# Lesson 17 — Manual Acknowledgment
+# Lesson 17: Manual Acknowledgment
 
-> **Part 3 — The Consumer** · 30 minutes
+> **Part 3: The Consumer**
 
 ---
 
 ## What you'll learn
 
-- How auto-commit loses records, and how it duplicates them
-- What `AckMode.MANUAL_IMMEDIATE` changes, and when `acknowledge()` must be called
+- Why committing an offset on a timer loses or duplicates records
+- What each Spring ack mode actually commits, and when
 - Why at-least-once plus idempotent processing beats chasing exactly-once
-- What `isolation.level: read_committed` actually filters
+- What `isolation.level` does, and when it does nothing
 
 ---
 
 ## Why this matters
 
-A committed offset is a claim: *"everything before this has been processed."* Auto-commit makes that claim on a five-second timer, without asking whether it's true.
+An offset commit is a claim: everything up to here has been processed. If that claim is made by a timer rather than by your code, it is a guess, and it will occasionally be wrong in whichever direction is worse for you.
 
-That single fact is the source of most "Kafka lost my data" and "Kafka duplicated my data" stories. Both are real, both are caused by the same setting, and which one you get depends only on where your consumer happens to crash.
-
-This is the lesson that decides your pipeline's delivery semantics.
+This is also the lesson that decides what Lesson 18 has to look like. Once you accept at-least-once delivery, the database write has to tolerate being repeated, and that shapes the entity.
 
 ---
 
 ## Before you start
 
-[Lesson 16](16-dtos-and-deserialization.md). A consumer that parses events.
+[Lesson 16](16-dtos-and-deserialization.md), with a consumer that parses events into a DTO.
 
 ---
 
 ## The concept
 
-### Auto-commit is a timer, not a promise
+### What the container already does, and what the raw client does
 
-With `enable.auto.commit=true` (the default), the consumer commits the offsets returned by the *last* `poll()` every `auto.commit.interval.ms` — 5 seconds — from within the poll loop.
+There is a widespread claim that auto-commit is the default and therefore your risk by default. That is true of the raw Kafka client and misleading in Spring.
 
-Note what it does **not** consult: whether your listener method finished, succeeded, or ran at all.
+`enable.auto.commit` defaults to `true` in the Kafka consumer API. Spring's listener container overrides it to `false` unless you explicitly set it, and commits offsets itself after your listener has been invoked. So out of the box you are already better off than the raw client.
 
-**How it loses records.** A poll returns records 100–199. The commit timer fires and commits offset 200. Your listener is on record 105 when the process is killed. On restart the group resumes at 200. **Records 105–199 were never processed and never will be.** Kafka's offset says they were.
+What you do not have out of the box is control over *when*. That is what the ack modes below decide, and it is why this lesson exists even though the dangerous default was already handled for you.
 
-**How it duplicates records.** A poll returns records 100–199. Your listener processes all of them, writing to a database. The process is killed at record 199, before the commit timer fires. On restart the group resumes at 100. **Records 100–198 are processed a second time.**
+### How auto-commit loses records
 
-You get data loss or duplication, and you don't choose which. You just find out.
+Set `enable-auto-commit: true` explicitly and the container steps aside, letting the client commit on a timer, every `auto.commit.interval.ms`, from inside the poll loop. It commits the offsets of the last `poll()`, and it does not consult whether your listener finished, succeeded, or ran at all.
+
+The loss window is narrower than most explanations suggest, and worth getting right.
+
+A single-threaded container hands every record from one poll to your listener before calling `poll()` again, and the commit is issued from inside `poll()`. So the timer cannot fire midway through your batch. What it can do is commit the *previous* poll's offsets while you are working, and commit the current batch the moment you return, whether or not the work stuck.
+
+The genuine loss cases are these:
+
+- **Your listener hands work to another thread.** The listener returns, the offset is committed, and the actual processing is still queued somewhere. Kill the process and that work is lost while Kafka says it was done.
+- **Your listener returns successfully but the effect is not durable.** A buffered write, an unflushed file, an async HTTP call. Same shape: the commit outran the work.
+- **You catch the exception and return normally.** The container sees success, commits, and the record is never retried.
+
+The duplication case is simpler and unavoidable. Your listener processes records 100 to 199 and writes them to a database, then the process is killed before the commit is sent. On restart the group resumes at 100 and those records are processed again.
+
+You get loss or duplication, and with a timer you do not choose which.
 
 ### Manual acknowledgment
 
-Turn the timer off:
-
-```yaml
-enable-auto-commit: false
-```
-
-and take an `Acknowledgment` parameter:
+Take an `Acknowledgment` parameter and commit explicitly:
 
 ```java
 public void consume(ConsumerRecord<String, String> record, Acknowledgment ack) {
-    process(record);     // if this throws, we never reach the next line
-    ack.acknowledge();   // commit only now
+    process(record);
+    ack.acknowledge();
 }
 ```
 
-The offset advances only after processing succeeded. If `process()` throws, no commit happens, the record is redelivered, and — with the error handler from Lesson 20 — retried or routed to a dead-letter topic.
+The offset advances only after processing succeeded. If `process()` throws, no commit happens, the record is redelivered, and with the error handler from Lesson 20 it is retried or routed to a dead-letter topic.
 
 The ordering is the entire point:
 
-> **Do the work. Then commit. Never the reverse.**
+> Do the work. Then commit. Never the reverse.
 
 ### Ack modes
 
-Spring's `ContainerProperties.AckMode` controls when a commit is actually sent:
+`ContainerProperties.AckMode` controls when a commit is actually sent:
 
 | Mode | Commits |
 |---|---|
-| `BATCH` (default) | after all records from one `poll()` are processed |
+| `BATCH` (default) | after all records from one `poll()` have been processed |
 | `RECORD` | after each record's listener returns |
-| `MANUAL` | when you call `acknowledge()`, queued until the poll loop ends |
-| `MANUAL_IMMEDIATE` | when you call `acknowledge()`, sent right away |
+| `MANUAL` | when you call `acknowledge()`, queued until the poll loop completes |
+| `MANUAL_IMMEDIATE` | when you call `acknowledge()`, sent straight away |
 
-`MANUAL` and `MANUAL_IMMEDIATE` both require an `Acknowledgment` parameter. The difference is latency: `MANUAL` batches the commit until the current poll's records are done; `MANUAL_IMMEDIATE` issues the commit on the consumer thread immediately.
+`MANUAL` and `MANUAL_IMMEDIATE` both require the `Acknowledgment` parameter. The difference is latency: `MANUAL` defers the commit until the current poll's records are done, while `MANUAL_IMMEDIATE` issues it on the consumer thread as soon as you ask.
 
-This project uses `MANUAL_IMMEDIATE`. The offset in `__consumer_offsets` reflects reality within milliseconds, which shortens the duplicate window if the process dies right after a database write. You pay one commit request per record.
+This course uses `MANUAL_IMMEDIATE`, so that the committed offset reflects reality within milliseconds and the duplicate window after a database write is as short as possible. You pay one commit request per record.
 
-> `MANUAL_IMMEDIATE` does not mean *synchronous*. It's `commitAsync` under the hood, issued at once rather than deferred.
+One correction worth making explicitly, because it is stated the wrong way round in a lot of material: **`MANUAL_IMMEDIATE` commits synchronously.** Spring's `ConsumerProperties.syncCommits` defaults to `true`, so the container calls `commitSync()` and waits for the broker to confirm. It is not a fire-and-forget `commitAsync()`.
 
-### At-least-once, and why that's fine
+That matters for two reasons. It costs a round trip per record, which is the real price of this mode. And it means that when `acknowledge()` returns, the offset genuinely is stored, so a crash immediately afterwards does not re-deliver the record.
 
-Manual ack gives you **at-least-once** delivery: every record is processed one or more times.
+### At-least-once, and why that is fine
 
-Consider the unavoidable gap:
+Manual ack gives you at-least-once delivery: every record is processed one or more times.
+
+Consider the gap you cannot close:
 
 ```
-1. process(record)      → row written to database
-2. ← process crashes here
-3. ack.acknowledge()    → never runs
+1. process(record)      row written to the database
+2. process crashes here
+3. ack.acknowledge()    never runs
 ```
 
-On restart, the record is redelivered and the row is written again. You cannot close this gap by reordering — committing first gives you at-most-once (data loss) instead. There is no ordering of two non-atomic operations that yields exactly-once.
+On restart the record is redelivered and the row is written again. Reordering does not help, because committing first gives you at-most-once and actual data loss instead. There is no ordering of two non-atomic operations that produces exactly-once.
 
-The fix isn't better ordering. It's making step 1 **idempotent**: applying it twice has the same effect as applying it once.
+The fix is not better ordering. It is making step 1 **idempotent**, so applying it twice has the same effect as applying it once.
 
-For this project, the natural idempotency key is `(kafkaPartition, kafkaOffset)` — a unique identifier for the record, which is exactly why the entity in Lesson 18 stores both. A unique constraint on that pair turns the duplicate write into a no-op.
+For this pipeline the natural idempotency key is the partition and offset together, which uniquely identify a record. That is exactly why the entity in Lesson 18 stores both, and why a unique constraint on that pair turns a duplicate write into a no-op.
 
-> **at-least-once + idempotent processing = effectively-once**
->
-> This is what almost every production Kafka pipeline actually does. It is simpler, faster, and more robust than transactions, and it works when your sink is a database rather than another Kafka topic.
+> At-least-once delivery plus idempotent processing gives you effectively-once. This is what almost every production Kafka pipeline actually does, and it is simpler, faster and more robust than transactions when your sink is a database rather than another Kafka topic.
 
 ### Exactly-once, honestly
 
-Kafka *does* offer exactly-once semantics, via transactional producers and `isolation.level=read_committed`. It works, with two caveats worth stating plainly:
+Kafka does offer exactly-once semantics through transactional producers and `isolation.level=read_committed`. It works, with two caveats worth stating plainly.
 
-**It only covers Kafka-to-Kafka.** A transaction spans a consume, a process, and a produce *back to Kafka*, atomically committing offsets and output records together. A write to PostgreSQL is not in the transaction and cannot be.
+**It only covers Kafka to Kafka.** A transaction spans a consume, a process and a produce back to Kafka, atomically committing offsets and output records together. A write to PostgreSQL is not in that transaction and cannot be.
 
 **It costs throughput.** Transaction coordination, markers in the log, and consumers buffering until commit.
 
@@ -119,62 +125,88 @@ Kafka *does* offer exactly-once semantics, via transactional producers and `isol
 isolation.level: read_committed
 ```
 
-This is a **consumer** setting, and it filters records written by **transactional producers**:
+This is a consumer setting that filters records written by transactional producers:
 
-- `read_uncommitted` (default) — deliver every record, including ones from transactions that later aborted
-- `read_committed` — deliver only records from committed transactions; skip aborted ones
+- `read_uncommitted`, the default, delivers every record including those from transactions that later aborted
+- `read_committed` delivers only records from committed transactions
 
-If no producer on the topic uses transactions, this setting changes nothing you can observe. This project sets it anyway: it's harmless, and it means that if a transactional producer ever writes to `wikimedia-stream`, the consumer will not process records from rolled-back transactions.
+If no producer on the topic uses transactions, this setting changes nothing you can observe. Setting it anyway is cheap insurance: if a transactional producer ever writes to this topic, your consumer will not process records from rolled-back transactions.
 
-One real consequence: with `read_committed`, a consumer cannot read past an open transaction (the *last stable offset*). A long-running transaction stalls consumers, and lag climbs even though records are being produced.
+One real consequence: with `read_committed` a consumer cannot read past an open transaction, known as the last stable offset. A long-running transaction stalls consumers and lag climbs even though records are being produced.
+
+```mermaid
+sequenceDiagram
+    participant C as Container
+    participant L as Your listener
+    participant DB as Database
+    participant K as Kafka
+
+    C->>L: consume(record, ack)
+    L->>DB: write row
+    DB-->>L: committed
+    L->>K: ack.acknowledge() commitSync
+    K-->>L: offset stored
+    L-->>C: return
+    Note over L,K: crash between the two arrows<br/>means the row exists and the offset does not,<br/>so the record is redelivered
+```
 
 ---
 
 ## Hands-on
 
-### 1. Turn off auto-commit
+### 1. Configure the consumer
 
-`application.yml`:
+Replace `application.yml` with this complete file:
 
 ```yaml
 spring:
+  application:
+    name: wikimedia-consumer
+
   kafka:
     bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
 
     consumer:
       group-id: wikimedia-consumer-group
       auto-offset-reset: earliest
+
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 
-      # The offset advances only when our code says so.
+      # Explicit, even though the listener container already defaults this to
+      # false. Stating it means nobody has to know that to read the config.
       enable-auto-commit: false
 
       max-poll-records: 500
 
       properties:
-        # Only meaningful if a transactional producer writes to this topic.
-        # Costs nothing, and prevents ever reading an aborted transaction's records.
+        # No effect unless a transactional producer writes to this topic, and
+        # correct behaviour if one ever does.
         isolation.level: read_committed
 
-        # The broker evicts a member that stops heartbeating for this long.
-        session.timeout.ms: 45000
-        heartbeat.interval.ms: 15000
+server:
+  port: 8082
 
-        # The broker evicts a member that stops *polling* for this long.
-        # Slow processing trips this one, not session.timeout.ms.
-        max.poll.interval.ms: 300000
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
 ```
 
-### 2. Configure the ack mode
+Note what is deliberately absent: any `spring.kafka.listener.*` properties. The next step declares the container factory in code, which owns the ack mode and every other listener-level setting, and Boot's auto-configured factory is not used. Splitting listener configuration between YAML and Java is how you end up with a setting that appears to be ignored.
 
-`enable-auto-commit: false` stops the timer, but Spring still needs telling *when* to commit. That lives on the listener container factory, not in YAML.
+### 2. Declare the container factory
 
-Create `config/KafkaConsumerConfig.java`:
+`src/main/java/com/example/wikimedia/consumer/config/KafkaConsumerConfig.java`:
 
 ```java
-package com.javaguy.consumer.config;
+package com.example.wikimedia.consumer.config;
 
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
@@ -185,10 +217,8 @@ import org.springframework.kafka.listener.ContainerProperties;
 public class KafkaConsumerConfig {
 
     /**
-     * Declaring this bean replaces Spring Boot's auto-configured factory.
-     * The ConsumerFactory is still auto-configured from spring.kafka.consumer.*,
-     * but every spring.kafka.listener.* property is now ignored — this factory
-     * owns all listener-level settings.
+     * Owns every listener-level setting. Declared explicitly rather than
+     * configured through spring.kafka.listener.* so there is one place to look.
      */
     @Bean
     public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
@@ -196,23 +226,26 @@ public class KafkaConsumerConfig {
 
         var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
         factory.setConsumerFactory(consumerFactory);
+
+        // Commit only when the listener says so, and send it immediately.
+        // MANUAL_IMMEDIATE uses commitSync, so acknowledge() waits for the broker.
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-        factory.getContainerProperties().setPollTimeout(3_000);
+
         return factory;
     }
 }
 ```
 
-Read that Javadoc twice. The moment you declare your own `kafkaListenerContainerFactory` bean, **`spring.kafka.listener.ack-mode` and every other `spring.kafka.listener.*` property stops having any effect.** Boot's auto-configuration backs off. Setting `ack-mode: manual_immediate` in YAML alongside this bean does nothing, and there is no warning.
+The `ConsumerFactory` is injected rather than constructed, so it still comes from your `application.yml`. You are overriding how the container behaves, not where it connects or how it deserialises.
 
-This is the most common way people configure manual ack, restart, and find offsets still committing on a timer.
+`ConsumerConfig` is imported for the exercises below; remove the import if your build warns about it being unused.
 
 ### 3. Acknowledge explicitly
 
 ```java
-package com.javaguy.consumer.consumer;
+package com.example.wikimedia.consumer.kafka;
 
-import com.javaguy.consumer.dto.WikimediaEventDto;
+import com.example.wikimedia.consumer.dto.WikimediaEventDto;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -238,14 +271,13 @@ public class WikimediaConsumer {
             groupId = "wikimedia-consumer-group"
     )
     public void consume(ConsumerRecord<String, String> record, Acknowledgment acknowledgment) {
-        WikimediaEventDto dto = parse(record);
+        WikimediaEventDto event = parse(record);
 
-        log.info("Consumed | partition={} offset={} type={} wiki={} title='{}'",
-                record.partition(), record.offset(), dto.type(), dto.wiki(), dto.title());
+        log.info("Consumed partition={} offset={} type={} title='{}'",
+                record.partition(), record.offset(), event.type(), event.title());
 
-        // Commit only after the record has been fully handled. If anything above
-        // throws, this line is never reached, the offset is not advanced, and the
-        // record is redelivered.
+        // Only now. Anything that throws above this line leaves the offset
+        // uncommitted, so the record is redelivered.
         acknowledgment.acknowledge();
     }
 
@@ -261,9 +293,16 @@ public class WikimediaConsumer {
 }
 ```
 
-### 4. Prove the offset doesn't move on failure
+### 4. Prove the offset does not advance on failure
 
-Stop the consumer. Note its committed offsets:
+Start the consumer, then produce a malformed record:
+
+```bash
+echo 'not json' | docker exec -i kafka-1 kafka-console-producer \
+  --bootstrap-server kafka-1:29092 --topic wikimedia-stream
+```
+
+Stop the consumer, then check the group:
 
 ```bash
 docker exec kafka-1 kafka-consumer-groups \
@@ -271,141 +310,132 @@ docker exec kafka-1 kafka-consumer-groups \
   --describe --group wikimedia-consumer-group
 ```
 
-Now temporarily make every record fail, right before the ack:
+The partition holding the bad record shows lag that does not clear, and its `CURRENT-OFFSET` sits at the bad record rather than past it. The offset was never committed because `acknowledge()` was never reached.
 
-```java
-        if (true) throw new IllegalStateException("simulated failure");
-        acknowledgment.acknowledge();
+That is manual acknowledgment working exactly as designed, and it is also the poison pill from Lesson 16 in its permanent form. Part 4 is what makes this recoverable.
+
+Clear it the same way as before, with the consumer stopped:
+
+```bash
+docker exec kafka-1 kafka-consumer-groups \
+  --bootstrap-server kafka-1:29092 \
+  --group wikimedia-consumer-group --topic wikimedia-stream \
+  --reset-offsets --shift-by 1 --execute
 ```
 
-Run the consumer for ten seconds, stop it, and describe the group again.
+### 5. Compare the modes
 
-**`CURRENT-OFFSET` has not moved.** The listener ran, threw, and never acknowledged. Kafka's record of your progress is unchanged, because your progress was zero.
+Change the ack mode to `ContainerProperties.AckMode.BATCH`, remove the `Acknowledgment` parameter, and restart. Everything still works, because the container commits after each poll's records are processed.
 
-Now do the same with `enable-auto-commit: true` (delete the `Acknowledgment` parameter and the ack). Run, throw on every record, stop, describe.
+Now put a `throw new IllegalStateException("boom")` at the end of the listener and compare behaviour under `BATCH` and under `MANUAL_IMMEDIATE`. In both cases the offset should not advance, because the container does not commit after a failed batch. The difference is granularity: under `BATCH`, one bad record in a poll of 500 means the whole poll's progress is unconfirmed.
 
-**The offset advanced.** Every record was "processed" according to Kafka. None of them were. You have just lost every record in that window, permanently, with no error visible anywhere except the exception logs nobody was reading.
-
-Remove the simulated failure and restore `enable-auto-commit: false`.
-
-### 5. See the duplicate window
-
-Restore the working listener, add a `Thread.sleep(2000)` between the log line and the `acknowledge()`, and start the consumer. While it's sleeping on a record, kill it with `Ctrl-C`.
-
-Restart. That record is delivered again — you'll see the same partition and offset logged twice.
-
-That's at-least-once, and there is no configuration that removes it. Only idempotent processing does, which is exactly what the next lesson builds.
+Restore `MANUAL_IMMEDIATE` and the `Acknowledgment` parameter, and remove the throw.
 
 ---
 
 ## Try it yourself
 
-1. Set `AckMode.RECORD` and remove the `Acknowledgment` parameter. Does it compile? Does it behave like manual ack? What's the difference in the crash window between `RECORD` and `MANUAL_IMMEDIATE`?
+1. Add `Thread.sleep(2000)` before `acknowledge()`, handling `InterruptedException` by restoring the interrupt flag and rethrowing. Kill the process during the sleep with Ctrl-C, then restart. Is the record redelivered? Explain which of the two operations completed.
 
-2. Keep `enable-auto-commit: false` but *never* call `acknowledge()`. Run for a minute, stop, restart. What happens, and how many times will a given record be delivered over the application's lifetime?
+2. Set `enable-auto-commit: true` and remove the `Acknowledgment` parameter. Does the application start? Read any warning carefully, then explain what the container is now no longer able to guarantee.
 
-3. Add `spring.kafka.listener.ack-mode: batch` to `application.yml` while `KafkaConsumerConfig` declares the factory with `MANUAL_IMMEDIATE`. Which wins? How would you have discovered that without this lesson telling you?
+3. Set `isolation.level: read_uncommitted` and observe that nothing changes. Then explain precisely what would have to be true of the producer for you to see a difference, and what a long-running transaction would do to your lag.
+
+4. Time it. Log the duration of `acknowledge()` for a thousand records under `MANUAL_IMMEDIATE`, then under `MANUAL`. Given what this lesson said about `commitSync`, predict the direction of the difference before you measure.
 
 ---
 
 ## Common mistakes
 
-**Setting `spring.kafka.listener.*` while declaring your own container factory.**
-Silently ignored. Boot's auto-configured factory — the one those properties bind to — isn't used.
+**Committing before processing.**
+That is at-most-once, and the failure mode is silent data loss rather than duplication.
 
-**Calling `acknowledge()` first, then processing.**
-That's at-most-once. A crash mid-processing loses the record permanently, and the offset says otherwise.
+**Believing auto-commit is Spring's default.**
+It is the raw client's default. The listener container turns it off and commits after invoking your listener.
 
-**Calling `acknowledge()` in a `finally` block.**
-Commits even when processing threw. You've reinvented auto-commit, with extra steps.
+**Believing `MANUAL_IMMEDIATE` is asynchronous.**
+`syncCommits` defaults to true, so it is a synchronous commit with a round trip per record.
 
-**Assuming manual ack prevents duplicates.**
-It prevents *loss*. Duplicates are inherent to at-least-once. Handle them with an idempotency key.
+**Handing work to another thread and then acknowledging.**
+The listener returns, the offset is committed, and the work has not happened. This is the real auto-commit failure shape, and manual ack does not save you from it.
 
-**Assuming `isolation.level: read_committed` deduplicates records.**
-It filters records from *aborted transactions*. With no transactional producer, it does nothing.
+**Catching the exception inside the listener and acknowledging anyway.**
+You have converted a retryable failure into permanent silent loss.
 
-**Confusing `session.timeout.ms` with `max.poll.interval.ms`.**
-The first covers heartbeats (a separate thread); the second covers time between polls. Slow processing trips the second one, and no amount of raising the first will help.
+**Chasing exactly-once for a database sink.**
+Kafka transactions cannot include your database. Idempotent processing is the answer.
+
+**Splitting listener configuration between YAML and a factory bean.**
+Whichever one you did not look at is the one that is in effect.
 
 ---
 
 ## Check your understanding
 
-**1. Auto-commit runs every 5 seconds. Your consumer processes a record, writes to the DB, and crashes 1 second later. Was data lost, duplicated, or neither?**
+**1. Your listener writes a row and then the process is killed before `acknowledge()`. What happens on restart?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Duplicated — the record is reprocessed on restart.
+The record is redelivered, because the offset was never committed, and the row is written a second time.
 
-The commit timer hadn't fired, so the offset still points at that record. On restart it's redelivered and written to the database a second time.
+This gap cannot be closed by reordering. Acknowledging first would mean that a crash after the commit and before the write loses the record entirely, which is worse.
 
-Had the crash happened 6 seconds later, after the timer fired, there'd be no duplicate. Same code, same crash, different outcome based purely on clock timing. That non-determinism is the real indictment of auto-commit: you can't reason about it.
-
-Note that manual ack doesn't fix *this* case either — the crash is between the DB write and the commit. What manual ack fixes is the *loss* case, where auto-commit advances past records the listener never touched.
+The answer is to make the write idempotent, so that the second attempt has no additional effect. Lesson 18 uses the partition and offset as the identity that makes that possible.
 
 </details>
 
-**2. Why is "process, then acknowledge" strictly better than "acknowledge, then process", given that both can produce a wrong result on a crash?**
+**2. Why does at-least-once plus idempotent processing beat Kafka transactions here?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Because their failure modes are not equally bad.
+Because the sink is a database, and a Kafka transaction cannot span it.
 
-*Process then ack* fails toward **duplication**: the work happened, the commit didn't, so it happens again. Duplication is detectable and repairable — a unique constraint, an upsert, or a dedup key makes it a no-op.
+Kafka's exactly-once machinery atomically commits offsets together with records produced back to Kafka. It has no way to include an external system, so a consume, transform and write-to-Postgres pipeline gets no atomicity from it at all.
 
-*Ack then process* fails toward **loss**: the offset advanced, the work never happened, and the record is gone from your consumer's future forever. There is no local information that a record was skipped. Recovery means resetting offsets and reprocessing a window, if you even notice.
-
-You cannot eliminate the gap between two non-atomic operations. You can choose which side of it you fail on. Always choose the recoverable one.
+Idempotent processing solves the actual problem: if applying a record twice has the same effect as applying it once, redelivery stops mattering, and you no longer need atomicity between two systems. It is also cheaper, with no transaction coordination and no consumer buffering.
 
 </details>
 
-**3. Your consumer takes 8 minutes to process one record. `session.timeout.ms=45000`, `heartbeat.interval.ms=15000`, `max.poll.interval.ms=300000`. What happens, and which setting is responsible?**
+**3. `MANUAL_IMMEDIATE` costs a round trip per record. When would `MANUAL` or `BATCH` be the better choice?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The consumer is evicted from the group after 5 minutes, by **`max.poll.interval.ms`**.
+When throughput matters more than the size of the duplicate window.
 
-`session.timeout.ms` is not the culprit. Heartbeats are sent by a *background thread*, independently of your listener, so the broker keeps seeing the member as alive for the whole 8 minutes.
+Every mode here gives at-least-once. They differ in how many records can be redelivered after a crash. `MANUAL_IMMEDIATE` keeps that to roughly one record, at the cost of a synchronous commit each time. `BATCH` commits once per poll, so a crash can redeliver up to `max.poll.records` records, and pays one round trip for all of them.
 
-But the broker also requires the member to call `poll()` at least every `max.poll.interval.ms`. Your listener is blocking the poll loop, so at 5 minutes the coordinator concludes the member is stuck, removes it, and rebalances its partitions to another consumer — which reprocesses from the last committed offset while your original consumer is still working.
-
-When the slow consumer finally finishes and tries to commit, it gets `CommitFailedException` because it no longer owns the partition.
-
-The fix is to make processing faster, lower `max-poll-records`, or raise `max.poll.interval.ms` — not to touch `session.timeout.ms`.
+If your processing is idempotent, and it should be, redelivering 500 records is a correctness non-event and a performance detail. That makes `BATCH` the right default for high-throughput pipelines, and `MANUAL_IMMEDIATE` right when each record's side effect is expensive to repeat.
 
 </details>
 
-**4. You use `MANUAL_IMMEDIATE`, process, then acknowledge. Records are still occasionally written twice to your database. Is something misconfigured?**
+**4. A colleague says manual ack gives exactly-once because the offset only moves after success. What are they missing?**
 
 <details>
 <summary>Reveal answer</summary>
 
-No. That's at-least-once working as designed.
+The crash between the work and the commit.
 
-There is an irreducible window between the database write completing and the offset commit being durably recorded. A crash in that window means the record is redelivered, and your listener writes the row again.
+Manual ack removes the possibility of committing before the work, which eliminates data loss. It cannot make the work and the commit a single atomic operation, so there is always a window in which the effect is durable and the offset is not.
 
-Narrowing the window (which `MANUAL_IMMEDIATE` does, versus `MANUAL` or `BATCH`) makes it rarer. Nothing makes it zero, because the database write and the Kafka commit are two separate systems with no shared transaction.
-
-The only real answer is to make the write idempotent — a unique constraint on `(partition, offset)`, or an upsert keyed on a business identifier — so a second write is a no-op. That's why the entity in Lesson 18 stores Kafka provenance columns.
+That window is what makes the guarantee at-least-once rather than exactly-once. Shrinking it, which is what `MANUAL_IMMEDIATE` does, does not close it.
 
 </details>
 
-**5. `isolation.level: read_committed` is set, and consumer lag suddenly climbs even though the consumer is healthy and CPU is idle. What might be happening?**
+**5. You set `isolation.level: read_committed` and nothing changed. Was it pointless?**
 
 <details>
 <summary>Reveal answer</summary>
 
-A transactional producer probably has a long-running open transaction on one of your partitions.
+Not pointless, but currently inert, and it is worth knowing which.
 
-Under `read_committed`, a consumer may not read past the **last stable offset** — the offset before the earliest still-open transaction. Records after it may belong to a transaction that ultimately aborts, so delivering them would be wrong.
+The setting filters out records belonging to aborted transactions. Your producer is not transactional, so every record on the topic is an ordinary write and there is nothing to filter.
 
-So the broker withholds them. Your consumer polls, gets nothing, and lag grows because the log end offset keeps advancing while the consumer's position cannot. Nothing is broken in the consumer, and no error is logged anywhere.
+It becomes load-bearing the moment any transactional producer writes to this topic, at which point the default of `read_uncommitted` would hand your consumer records from transactions that were rolled back, which is data that was explicitly retracted.
 
-Under `read_uncommitted` those records would be delivered immediately — and you'd risk processing records from a transaction that later rolled back. The stall is the price of the guarantee.
+The cost of setting it now is one line and one behaviour to remember: a `read_committed` consumer cannot read past an open transaction, so a long-running transaction elsewhere shows up as lag on your consumer that no amount of scaling will fix.
 
 </details>
 
@@ -413,10 +443,10 @@ Under `read_uncommitted` those records would be delivered immediately — and yo
 
 ## Recap
 
-Auto-commit advances offsets on a timer that knows nothing about your listener, and depending on where you crash it silently loses or duplicates records. Manual acknowledgment moves the commit to the one place it belongs: after the work succeeded. That buys you at-least-once delivery, and a duplicate window you close not with configuration but with idempotent processing.
+An offset commit is a claim that everything up to it has been processed, so your code should make that claim rather than a timer. The container already disables the raw client's auto-commit, and manual acknowledgment is how you take control of *when*.
 
-`MANUAL_IMMEDIATE` must be set on your own container factory — and declaring that factory silently disables every `spring.kafka.listener.*` property.
+`MANUAL_IMMEDIATE` commits synchronously, one round trip per record, in exchange for the shortest possible duplicate window. Do the work, then commit, never the reverse.
 
-Now let's do some work worth acknowledging.
+The gap between the work and the commit cannot be closed, which makes the guarantee at-least-once. That is fine, provided processing is idempotent, and the partition and offset give you the identity to make it so.
 
-**Next:** [Lesson 18 — Persisting with JPA →](18-persisting-with-jpa.md)
+**Next:** [Lesson 18: Persisting with JPA](18-persisting-with-jpa.md)

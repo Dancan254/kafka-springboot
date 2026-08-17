@@ -1,130 +1,151 @@
-# Lesson 12 — Batching, Linger & Compression
+# Lesson 12: Batching, Linger and Compression
 
-> **Part 2 — The Producer** · 25 minutes
+> **Part 2: The Producer**
 
 ---
 
 ## What you'll learn
 
-- How `batch.size` and `linger.ms` interact — and why tuning one without the other does nothing
+- How `batch.size` and `linger.ms` interact, and why tuning one without the other does nothing
 - Why compression only works because of batching
-- How to choose a compression codec, and why it must match the topic's
+- How to choose a codec, and why it must match the topic's
 - What `buffer.memory` protects you from, and how it fails
 
 ---
 
 ## Why this matters
 
-A Kafka producer that sends one record per network request is slow, and no amount of hardware fixes it. The cost of a produce request — TCP, the broker's request queue, the acknowledgment round trip — is roughly the same whether the request carries one record or ten thousand.
+A producer that sends one record per network request is slow, and no amount of hardware fixes it. The cost of a produce request, meaning the TCP round trip, the broker's request queue and the acknowledgment, is roughly the same whether the request carries one record or ten thousand.
 
-Batching is where Kafka's throughput actually comes from. It's also where its *latency* comes from, and the two are the same dial pointed in opposite directions.
+Batching is where Kafka's throughput actually comes from. It is also where its latency comes from, and the two are the same dial pointed in opposite directions.
 
 ---
 
 ## Before you start
 
-[Lesson 11](11-keys-and-partition-affinity.md).
+[Lesson 11](11-keys-and-partition-affinity.md), with a keyed producer.
 
 ---
 
 ## The concept
 
-### The producer is asynchronous, and that's the point
+### The producer is asynchronous, and that is the point
 
 `send()` does not talk to a broker. It serialises the record, appends it to an in-memory buffer, and returns.
 
-A background I/O thread drains that buffer, groups records into **batches** — one batch per partition — and ships each batch as a single request.
+A background thread drains that buffer, groups records into **batches**, one batch per partition, and ships each batch as a single request.
 
 ```mermaid
 flowchart LR
-    A["send()"] --> B["record accumulator<br/>(buffer.memory)"]
+    A["send()"] --> B["record accumulator<br/>buffer.memory"]
     B --> P0["batch for partition 0"]
     B --> P1["batch for partition 1"]
-    P0 & P1 --> IO["I/O thread"]
+    P0 --> IO["sender thread"]
+    P1 --> IO
     IO --> K["broker"]
 ```
 
-So the question "when does a record actually get sent?" has two answers, and the batch is sent when **either** is satisfied.
+So the question "when does a record actually get sent?" has two answers, and a batch is sent when either is satisfied.
 
-### `batch.size` — the size trigger
+### `batch.size` is the size trigger
 
-Maximum bytes in one batch, **per partition**. Default 16 KiB.
+The maximum bytes in one batch, per partition. The default is 16 KiB.
 
 When a partition's batch fills to `batch.size`, it is sent immediately.
 
-This is an upper bound, not a target. If the buffer holds only one record when the I/O thread comes around, that record is sent alone — a batch of one. `batch.size` never *makes* the producer wait.
+This is an upper bound rather than a target. If the buffer holds one record when the sender thread comes around, that record is sent alone, as a batch of one. `batch.size` never makes the producer wait.
 
-> A record larger than `batch.size` gets its own batch. It isn't rejected. (The limit that rejects is `max.request.size`, default 1 MiB, and the broker's `message.max.bytes`.)
+It is also the value that drives the keyless partition switching you measured in Lesson 04, which is why raising it makes an unkeyed producer stick to one partition for longer.
 
-### `linger.ms` — the time trigger
+> A record larger than `batch.size` gets its own batch rather than being rejected. The limits that reject are `max.request.size`, default 1 MiB, and the broker's `message.max.bytes`.
 
-How long the producer will **wait** for more records before sending a partially-full batch. Default `0`.
+### `linger.ms` is the time trigger
 
-`linger.ms=0` does not mean "no batching." It means "don't deliberately wait." Records that arrive while a request is in flight still accumulate and go out together — you get batching only as an accident of load.
+How long the producer will wait for more records before sending a partially full batch. The default is `0`.
 
-`linger.ms=20` means: when the first record lands in an empty batch, start a 20 ms timer. Send when the batch fills *or* the timer expires, whichever comes first.
+`linger.ms=0` does not mean no batching. It means no deliberate waiting. Records arriving while a request is already in flight still accumulate and go out together, so you get batching as an accident of load rather than as a policy.
 
-**This is the setting that trades latency for throughput**, and it's the one people forget. Raising `batch.size` alone changes nothing under light load, because the batch is dispatched the moment the I/O thread is free. You must give the producer permission to wait.
+`linger.ms=20` means that when the first record lands in an empty batch, a 20 millisecond timer starts. The batch is sent when it fills or when the timer expires, whichever happens first.
 
-Under heavy load, `linger.ms` costs almost nothing: batches fill before the timer expires, so the size trigger fires first. Under light load, it adds up to `linger.ms` of latency and dramatically improves batching. That asymmetry is why 5–20 ms is nearly free in practice.
+This is the setting that trades latency for throughput, and it is the one people forget. Raising `batch.size` alone changes nothing under light load, because the batch is dispatched the moment the sender thread is free. You have to give the producer permission to wait.
+
+Under heavy load `linger.ms` costs almost nothing, because batches fill before the timer expires and the size trigger fires first. Under light load it adds up to `linger.ms` of latency and improves batching dramatically. That asymmetry is why 5 to 20 milliseconds is nearly free in practice.
 
 ### Compression needs batching
 
-Kafka compresses the **batch**, not the record.
+Kafka compresses the batch, not the record.
 
-Compressing a single 200-byte JSON document achieves very little — there isn't enough repetition to build a dictionary from. Compressing 500 similar JSON documents together achieves a great deal, because they share field names, structure, and vocabulary.
+Compressing a single 200 byte JSON document achieves very little, because there is not enough repetition to build a dictionary from. Compressing 500 similar JSON documents together achieves a great deal, because they share field names, structure and vocabulary.
 
-So `compression.type` and `linger.ms` are the same lever. A producer with `linger.ms=0` under light load compresses batches of one, and reports a compression ratio near 1.0 while burning CPU for nothing.
+So `compression.type` and `linger.ms` are the same lever. A producer with `linger.ms=0` under light load compresses batches of one, reports a compression ratio near 1.0, and burns CPU for nothing.
 
 | Codec | Ratio | CPU | Use when |
 |---|---|---|---|
-| `none` | 1.0 | none | records are already compressed (images, video) |
-| `gzip` | best | highest | storage cost dominates, throughput doesn't |
-| `snappy` | good | low | balanced default; what this project uses |
+| `none` | 1.0 | none | records are already compressed, such as images or video |
+| `gzip` | best | highest | storage cost dominates and throughput does not |
+| `snappy` | good | low | a balanced, universally supported default |
 | `lz4` | good | lowest | maximum throughput |
-| `zstd` | very good | moderate | best overall ratio-to-speed; Kafka 2.1+ |
+| `zstd` | very good | moderate | best overall ratio to speed |
 
-`zstd` is the modern recommendation for most workloads. This project uses `snappy` because it's the conservative, universally-supported choice.
+`zstd` is the modern recommendation for most workloads. This course uses `snappy` as the conservative choice, and the exercises ask you to measure the difference rather than take that on faith.
 
 ### Match the topic's codec
 
-You set `compression.type=snappy` on the topic in Lesson 09. That was not decoration.
+You set `compression.type=snappy` on the topic in Lesson 09, and that was not decoration.
 
-If the producer's codec matches the topic's, the broker stores the compressed batch **exactly as it arrived** — zero broker CPU. If they differ, the broker must decompress every batch and recompress it in the topic's codec, on every write, forever. It's a large cost, and nothing warns you.
+If the producer's codec matches the topic's, the broker stores the compressed batch exactly as it arrived, at zero broker CPU cost. If they differ, the broker decompresses every batch and recompresses it in the topic's codec, on every write, forever. The cost is large and nothing warns you.
 
-Setting the topic to `producer` (the default) means "store whatever the producer sent," which side-steps the problem entirely — at the cost of a topic that may contain batches in several codecs.
+Setting the topic to `producer`, which is the default, means "store whatever the producer sent". That side-steps the problem, at the cost of a topic whose batches may be in several codecs.
 
-### `buffer.memory` — and how `send()` blocks
+### `buffer.memory`, and how `send()` blocks
 
-Total memory the producer may use for un-sent records. Default 32 MiB.
+The total memory the producer may use for unsent records. The default is 32 MiB.
 
-If your application produces faster than the network can drain the buffer, the buffer fills. At that point `send()` — the method you believed was non-blocking — **blocks**, for up to `max.block.ms` (default 60 s), and then throws `TimeoutException`.
+If your application produces faster than the network can drain the buffer, the buffer fills. At that point `send()`, the method you believed was non-blocking, blocks for up to `max.block.ms`, which defaults to 60 seconds, and then throws `TimeoutException`.
 
-This is the producer applying backpressure to your application. It's the correct behaviour, and it's a nasty surprise the first time a thread pool stalls inside a "non-blocking" call.
+This is the producer applying backpressure to your application. It is correct behaviour, and it is an unpleasant surprise the first time a thread pool stalls inside a call documented as asynchronous.
 
 ---
 
 ## Hands-on
 
-### 1. Configure batching and compression
+### 1. Add actuator
 
-Extend `application.yml`:
+You are about to measure the producer, which means you need its metrics exposed. Add the dependency to `pom.xml`:
+
+```xml
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+```
+
+Adding actuator gives the application a web server, which has a side effect worth predicting: from now on it will keep running after `ApplicationRunner` finishes, instead of exiting as it did in Lesson 08. Stop it with Ctrl-C.
+
+### 2. Configure batching and compression
+
+Replace `application.yml` with this complete file. Every key from Lesson 10 is still here, plus the batching settings and the management block that exposes metrics:
 
 ```yaml
 spring:
+  application:
+    name: wikimedia-producer
+
   kafka:
     producer:
       bootstrap-servers: localhost:9092,localhost:9093,localhost:9094
+
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
       acks: all
       retries: 3
 
       # Batch up to 32 KiB per partition before flushing on size.
-      # Bigger batches → better throughput and much better compression.
+      # Larger batches mean better throughput and much better compression.
       batch-size: 32768
 
-      # Total buffer for un-sent records. When this fills, send() blocks
+      # Total buffer for unsent records. When this fills, send() blocks
       # for max.block.ms and then throws.
       buffer-memory: 33554432
 
@@ -145,29 +166,51 @@ spring:
 
         # How long to wait for a broker's response to a single request.
         request.timeout.ms: 30000
+
+server:
+  port: 8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
 ```
 
-Note where each property lives. `batch-size`, `buffer-memory`, and `compression-type` are Spring Boot's own relaxed-binding names under `producer:`. `linger.ms`, `delivery.timeout.ms`, and `request.timeout.ms` have no Spring equivalent, so they go under `properties:` with Kafka's dotted names.
+Note where each property lives. `batch-size`, `buffer-memory` and `compression-type` are Spring Boot's own relaxed-binding names under `producer:`. `linger.ms`, `delivery.timeout.ms` and `request.timeout.ms` have no Spring equivalent, so they go under `properties:` with Kafka's dotted names.
 
-> Putting `linger.ms: 20` directly under `producer:` is silently ignored. The YAML parses, the app starts, and you get `linger.ms=0`. This is the single most common Kafka-in-Spring configuration bug.
+The `management` block matters as much as the dependency. Actuator exposes only `health` by default, so without `include: metrics` every metrics URL below returns 404 even though the metrics are being collected.
 
-### 2. The timeout hierarchy
+> Putting `linger.ms: 20` directly under `producer:` is silently ignored. The YAML parses, the application starts, and you get `linger.ms=0`. This is the most common Kafka-in-Spring configuration mistake, and it is the same trap as `enable.idempotence` in Lesson 10.
 
-Three timeouts, and they must be ordered correctly:
+### 3. The timeout hierarchy
+
+Three timeouts, which must be ordered correctly:
 
 ```
 delivery.timeout.ms  >=  linger.ms + request.timeout.ms
-   120,000           >=      20    +     30,000
+     120000          >=     20     +      30000
 ```
 
-- **`request.timeout.ms`** — one attempt to reach a broker and get a reply.
-- **`delivery.timeout.ms`** — the total budget for a `send()`, covering time in the buffer, `linger.ms`, every retry, and every `request.timeout.ms`.
+- **`request.timeout.ms`** is one attempt to reach a broker and get a reply.
+- **`delivery.timeout.ms`** is the total budget for a `send()`, covering time in the buffer, `linger.ms`, every retry and every `request.timeout.ms`.
 
-`retries` is almost irrelevant once idempotence is on. What actually bounds retrying is `delivery.timeout.ms`. When it expires, the `CompletableFuture` from `send()` completes exceptionally with a `TimeoutException`, and the record is dropped. Kafka validates the inequality at startup and refuses to start if it's violated.
+As Lesson 10 noted, `retries` is nearly irrelevant once idempotence is on. What actually bounds retrying is `delivery.timeout.ms`. When it expires, the `CompletableFuture` from `send()` completes exceptionally with a `TimeoutException` and the record is dropped. Kafka validates the inequality at startup and refuses to start if you violate it.
 
-### 3. Watch batching happen
+### 4. Watch batching happen
 
-Set `linger.ms: 0` and produce 1,000 records in a tight loop:
+Set `linger.ms: 0` and produce a thousand records in a tight loop. `WikimediaProducer` needs to expose a flush for this, so add one method to it temporarily:
+
+```java
+    public void flush() {
+        kafkaTemplate.flush();
+    }
+```
+
+Then in `StartupMessageSender`:
 
 ```java
     @Override
@@ -176,138 +219,156 @@ Set `linger.ms: 0` and produce 1,000 records in a tight loop:
         for (int i = 0; i < 1_000; i++) {
             producer.sendMessage("key-" + (i % 100), "payload-number-" + i);
         }
-        kafkaTemplate.flush();
+        producer.flush();
         log.info("Took {} ms", (System.nanoTime() - start) / 1_000_000);
     }
 ```
 
-`flush()` blocks until every buffered record has been acknowledged — otherwise you'd be timing how fast you can fill a buffer.
+`flush()` blocks until every buffered record has been acknowledged. Without it you would be timing how fast you can fill a buffer, which is a measurement of nothing.
 
-Now set `linger.ms: 20` and run again. Fewer, larger requests. On a local cluster the wall-clock difference is small; the difference in *request count* is not.
-
-You can see it in the producer's own metrics. Add actuator and query:
+Run it, then read the producer's own metrics:
 
 ```bash
-curl -s localhost:8081/actuator/metrics/kafka.producer.record.send.rate
 curl -s localhost:8081/actuator/metrics/kafka.producer.batch.size.avg
+curl -s localhost:8081/actuator/metrics/kafka.producer.record.send.rate
 ```
 
-`batch.size.avg` is the number that tells the story. With `linger.ms=0` under light load it hovers near one record's worth. With `linger.ms=20` it climbs.
+Now set `linger.ms: 20` and run again.
 
-### 4. Compression ratio
+`batch.size.avg` is the number that tells the story. With `linger.ms=0` under light load it sits near a single record's worth. With `linger.ms=20` it climbs, because the producer is finally allowed to wait. Wall-clock time on a local cluster barely moves; the request count does.
+
+### 5. Compression ratio
 
 ```bash
 curl -s localhost:8081/actuator/metrics/kafka.producer.compression.rate.avg
 ```
 
-A value near `1.0` means "no compression happening." With `snappy` and real batches of similar JSON, expect something in the 0.2–0.4 range — a 60–80% reduction.
+A value near 1.0 means compression is achieving nothing. Run this with `linger.ms=0` and again with `linger.ms=20`, and you will see the ratio improve purely because the batches got bigger. Nothing about the codec changed.
 
-Then set `linger.ms: 0` and watch the ratio move back toward 1.0. Same codec, same data, no batches to compress.
+That is the point of this lesson in one measurement: compression is a function of batching, not a setting you turn on.
 
-**That's the lesson in one metric.** Compression is not a property of your codec choice. It is a property of your batching.
+### 6. Put the sender back
+
+Remove the loop, remove the temporary `flush()` method, and restore the six keyed records from Lesson 11.
 
 ---
 
 ## Try it yourself
 
-1. Set `batch-size: 1000000` (1 MB) and `linger.ms: 0`. Produce 1,000 small records. Does `batch.size.avg` go up? Explain why the large `batch.size` bought you nothing.
+1. Set `compression-type: gzip` on the producer while the topic is still `snappy`. Everything works. Explain what the broker is now doing on every write, and find a metric or a broker log line that would let you notice.
 
-2. Set `buffer-memory: 32768` (32 KiB) and `max.block.ms: 2000`, then produce 100,000 records as fast as you can. What exception surfaces, and from which method? Was `send()` non-blocking?
+2. Set `buffer-memory: 65536`, which is 64 KiB, `linger.ms: 1000`, and produce 100,000 records in a loop. `send()` will start blocking. Time how long the loop takes, then set `max.block.ms: 1000` and run again. Which exception do you get, and on which call?
 
-3. Set the producer to `compression-type: gzip` while the topic stays `snappy`. Everything works. What is the broker doing on every single write, and how would you ever notice?
+3. Set `delivery.timeout.ms: 1000` with `request.timeout.ms: 30000` and start the application. It refuses. Read the message, then explain the inequality in your own words.
+
+4. Compare codecs on the same payload. Run the thousand-record loop with `snappy`, `lz4`, `gzip` and `zstd`, recording `compression.rate.avg` each time. Which would you pick for this workload, and what would change your mind if the records were 10 KiB each instead of 30 bytes?
 
 ---
 
 ## Common mistakes
 
+**Raising `batch.size` and expecting more throughput.**
+Under light load nothing changes, because the batch is sent as soon as the sender thread is free. `linger.ms` is what makes `batch.size` meaningful.
+
 **Putting `linger.ms` under `producer:` instead of `properties:`.**
-Silently ignored. You get `linger.ms=0` and wonder why `batch.size` did nothing.
+Silently ignored, and you keep the default of 0.
 
-**Raising `batch.size` without raising `linger.ms`.**
-`batch.size` is a ceiling, not a target. Under light load the batch ships as soon as the I/O thread is free. Nothing changes.
-
-**Enabling compression with `linger.ms=0` and light load.**
-You compress batches of one, gain almost no ratio, and pay CPU on producer and broker. Then you conclude "compression doesn't help."
+**Enabling compression with `linger.ms=0` under light load.**
+You compress batches of one, gain nothing, and pay CPU on both the producer and the consumer.
 
 **Mismatching producer and topic codecs.**
-The broker decompresses and recompresses every batch. Invisible, permanent, expensive.
+The broker decompresses and recompresses every batch, permanently, with no warning.
 
-**Assuming `send()` never blocks.**
-It blocks when `buffer.memory` is exhausted, for `max.block.ms`, then throws. Under a downstream slowdown this is how a Kafka problem becomes a thread-pool exhaustion problem in your service.
+**Believing `send()` never blocks.**
+It blocks when the buffer is full, for up to `max.block.ms`, then throws.
 
-**Setting `retries` high and thinking that controls retrying.**
-`delivery.timeout.ms` is the real budget. When it expires, retries stop regardless.
+**Tuning `retries` to control how long a send keeps trying.**
+`delivery.timeout.ms` is the real bound. With idempotence on, `retries` mostly determines how many attempts fit inside that budget.
+
+**Adding actuator and forgetting the exposure list.**
+The metrics exist and every URL returns 404 until you include them.
 
 ---
 
 ## Check your understanding
 
-**1. You set `batch.size=1MB`. Your app sends one record every 5 seconds. How large are your batches?**
+**1. You set `batch.size` to 1 MiB and see no throughput improvement. Why?**
 
 <details>
 <summary>Reveal answer</summary>
 
-One record each.
+Because `batch.size` is a ceiling, not a target, and `linger.ms` is still 0.
 
-`batch.size` is a maximum, not a target. The producer never delays a record to fill a batch unless `linger.ms` tells it to. With the default `linger.ms=0`, each record is dispatched as soon as the I/O thread can take it, alone.
+The sender thread dispatches whatever is in the accumulator as soon as it is free. Under light load that is one or two records, far below either the old ceiling or the new one, so raising the ceiling changed nothing.
 
-To batch a low-rate stream you must raise `linger.ms` and accept the added latency. There is no way to batch without waiting — the records don't exist yet.
+The producer only accumulates a large batch if it is either saturated with records or willing to wait. `linger.ms` is how you grant the second option.
 
 </details>
 
-**2. Your compression ratio metric reads `0.98` with `snappy` enabled. What's wrong?**
+**2. Your compression ratio metric reads 1.02 with `snappy` enabled. Is compression broken?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Your batches contain roughly one record each, so there's nothing for the compressor to exploit.
+No. Your batches are too small to compress.
 
-Compression operates on the batch. A lone 200-byte JSON record has no repeated structure to dictionary-encode. Five hundred of them share every field name, and compress superbly.
+Compression operates on the batch. A batch containing one small JSON record has almost no internal repetition, so there is nothing for the codec to exploit, and you pay CPU on both sides for a ratio of essentially 1.
 
-The fix is not a different codec — it's `linger.ms`. Raise it (and check your load is high enough to fill batches at all). You're currently paying CPU on both producer and broker for a 2% saving.
+Raise `linger.ms` so batches actually accumulate, and the ratio improves without touching the codec. If it still does not improve, check whether your payloads are already compressed, in which case `none` is the honest setting.
 
 </details>
 
-**3. Producer sets `compression.type=lz4`. Topic sets `compression.type=snappy`. Everything works. What is the cost, and how would you detect it?**
+**3. `delivery.timeout.ms` is 120 seconds and `retries` is 3. A broker is unreachable for 10 minutes. When does your `send()` fail, and with what?**
 
 <details>
 <summary>Reveal answer</summary>
 
-The broker decompresses every incoming lz4 batch and recompresses it as snappy, on every write, forever. This is pure broker CPU, and it also defeats the zero-copy path the broker normally uses to serve batches straight from disk to consumers.
+After roughly 120 seconds, with the future completing exceptionally, carrying a `TimeoutException`.
 
-Nothing errors. Nothing logs. You'd detect it as unexplained broker CPU that scales with produce throughput, and you'd confirm it by comparing the producer's and topic's `compression.type`.
+`retries` does not decide this. Attempts are bounded by the delivery deadline, so whichever runs out first ends the send, and here the deadline does. Setting `retries` to 3 or to 300 would make no difference against a broker that is down for ten minutes.
 
-Setting the topic to `compression.type=producer` (the default) avoids this entirely: the broker stores whatever arrives, untouched.
+The record is then dropped by the client. If your code ignored the future, as the producer did until Lesson 13, that drop is completely silent.
 
 </details>
 
-**4. Explain how a slow Kafka broker can exhaust your web application's thread pool, given that `send()` is documented as asynchronous.**
+**4. Why does the same `linger.ms` value cost almost nothing under heavy load and a lot under light load?**
 
 <details>
 <summary>Reveal answer</summary>
 
-`send()` is asynchronous only while there is room in the record accumulator.
+Because it is a maximum wait rather than a fixed delay, and under heavy load the size trigger fires first.
 
-If brokers slow down, the I/O thread drains the buffer more slowly than your request threads fill it. `buffer.memory` (default 32 MiB) fills. The next `send()` cannot allocate space, so it **blocks** for up to `max.block.ms` — 60 seconds by default.
+With records arriving continuously, a batch reaches `batch.size` in well under 20 milliseconds, so the timer never expires and the added latency is a fraction of the batch fill time. With one record every few seconds, the timer always expires, so every record pays the full 20 milliseconds.
 
-Now every HTTP request thread that calls `send()` parks for up to a minute. The thread pool exhausts, the service stops accepting requests, and health checks fail. Your service is down because a broker got slow, in a call you believed returned immediately.
-
-The mitigations: lower `max.block.ms` so you fail fast, size `buffer.memory` deliberately, and never call `send()` from a thread whose blocking would take down the service.
+The asymmetry is why a small `linger.ms` is close to free in aggregate: it is applied exactly when the system is idle enough not to care, and skipped exactly when throughput matters.
 
 </details>
 
-**5. `delivery.timeout.ms=120000`, `retries=3`, `request.timeout.ms=30000`. A broker is unreachable for 90 seconds. How many attempts are made, and what does the caller observe?**
+**5. Your application's thread pool stalls, and stack traces show threads inside `kafkaTemplate.send()`. What has happened, and which two settings are involved?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Fewer than you'd guess from `retries=3`, and the caller observes a failed future — eventually.
+The record accumulator is full, so `send()` is blocking rather than returning.
 
-Each attempt can consume up to `request.timeout.ms` (30 s) before it's considered failed, plus backoff between attempts. Within the 120 s `delivery.timeout.ms` budget there's room for roughly three or four attempts, but `retries=3` caps it at 4 total attempts anyway.
+`buffer.memory` decides when this starts: once unsent records fill it, there is nowhere to append, and the only options are to wait or to fail. `max.block.ms` decides how long the wait lasts before a `TimeoutException` is thrown.
 
-The important part: **`delivery.timeout.ms` is the authority.** If it expires mid-retry, the record is abandoned immediately even with retries remaining. The `CompletableFuture` returned by `send()` completes exceptionally with a `TimeoutException`.
+The underlying cause is always the same shape: you are producing faster than the cluster is accepting, whether because of a slow broker, a shrunken ISR refusing `acks=all` writes, or genuinely too much traffic. The buffer is the shock absorber, and blocking is what happens when it is exhausted.
 
-And if you never looked at that future — as in Lesson 08 — you observe nothing at all. The record is silently gone. Which is precisely the subject of the next lesson.
+Raising `buffer.memory` buys time and does not fix a sustained imbalance.
+
+</details>
+
+**6. Lesson 09 set the topic's codec and this lesson set the producer's. Why is that duplication not redundant?**
+
+<details>
+<summary>Reveal answer</summary>
+
+Because they answer different questions, and only one of them is about your producer.
+
+The producer's `compression.type` decides how batches are compressed on the wire. The topic's decides what the broker is willing to store. When they agree, the broker writes the batch through untouched, which is the cheap path.
+
+The duplication exists because a topic has many producers, potentially written by other teams, and the topic's setting is the only place you can state a cluster-wide expectation. Setting it to `producer` avoids all recompression but gives up that control, leaving a topic whose segments hold a mixture of codecs that every consumer must be able to decode.
 
 </details>
 
@@ -315,8 +376,10 @@ And if you never looked at that future — as in Lesson 08 — you observe nothi
 
 ## Recap
 
-`send()` buffers; a background thread batches per partition and ships. `batch.size` caps a batch, `linger.ms` grants permission to wait for one, and neither works without the other. Compression operates on batches, so `linger.ms` is really a compression setting too — and the codec must match the topic's or the broker pays forever. When the buffer fills, `send()` blocks and then throws.
+`batch.size` and `linger.ms` are the size and time triggers for sending a batch, and either alone is nearly useless: a large ceiling with no willingness to wait produces batches of one. Compression operates on batches, so it is a function of your batching rather than a switch, and it must match the topic's codec or the broker pays to translate every write.
 
-Every failure in this lesson arrives on the `CompletableFuture` you've been discarding since Lesson 08.
+`buffer.memory` is the shock absorber between your application and the network, and `send()` blocks when it is exhausted.
 
-**Next:** [Lesson 13 — Send callbacks & error handling →](13-send-callbacks-and-errors.md)
+You also added actuator, which means the producer can now be measured rather than guessed at, and it stays running instead of exiting.
+
+**Next:** [Lesson 13: Send Callbacks and Error Handling](13-send-callbacks-and-errors.md)
