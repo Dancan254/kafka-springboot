@@ -15,9 +15,11 @@ exporters:
   prometheus:
     endpoint: "0.0.0.0:8889"
 
-  # Forward traces to Grafana Tempo
+  # Forward traces to Grafana Tempo.
+  # 4318 is Tempo's OTLP receiver. Port 3200 serves only the query API — posting
+  # traces there returns 404.
   otlphttp/tempo:
-    endpoint: http://tempo:3200/otlp
+    endpoint: http://tempo:4318
     tls:
       insecure: true
 
