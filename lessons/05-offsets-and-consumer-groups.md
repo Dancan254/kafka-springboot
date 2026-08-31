@@ -268,13 +268,44 @@ Other targets, all useful in an incident:
 
 ### 6. Clean up
 
+Delete the throwaway topics from Lessons 03 to 05, one command each so you can see each one succeed:
+
 ```bash
-for t in lessons-groups lessons-keys lessons-keys-4 lessons-nokey lessons-demo ordering-test; do
-  docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic $t 2>/dev/null
-done
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic lessons-groups
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic lessons-keys
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic lessons-keys-4
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic lessons-nokey
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --delete --topic ordering-test
 ```
 
-Leave `__consumer_offsets` alone. Lesson 06 starts from a clean cluster anyway, for reasons that will be obvious when you get there.
+Each prints nothing on success. If you read a lesson rather than running its hands-on steps, you will see this instead:
+
+```
+Error while executing topic command : Topic 'lessons-keys' does not exist as expected
+```
+
+That is harmless. Deleting a topic that was never created is a no-op, which is what "as expected" is telling you, and the command carries on to the next one.
+
+It is also worth noticing where that line came from. `kafka-topics` writes it to **stdout**, and only the `[timestamp] ERROR ...` detail line that follows it to stderr. Appending `2>/dev/null` to these commands therefore hides the useful detail and keeps the bare complaint, which is the opposite of what you would want. This course does not suppress either.
+
+Confirm the result:
+
+```bash
+docker exec kafka-1 kafka-topics --bootstrap-server localhost:9092 --list
+```
+
+```
+__consumer_offsets
+lessons-demo
+```
+
+Two deliberate survivors.
+
+**`lessons-demo` stays**, because Lesson 07 reads from it to show that consuming existing data and creating a new topic fail differently when the controller quorum is lost. Delete it now and that exercise proves nothing.
+
+**`__consumer_offsets` stays** because it is not yours to delete. It holds every group's committed position, and Kafka recreates it on the next commit anyway.
+
+Note that nothing here wipes the cluster. Lesson 06 adds two brokers to the Compose file and restarts, and your topics, records and offsets all survive that.
 
 ---
 

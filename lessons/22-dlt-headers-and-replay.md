@@ -274,10 +274,12 @@ Produce a poison pill, let it be dead-lettered, then replay it manually so that 
 ```bash
 docker exec kafka-1 kafka-console-consumer \
   --bootstrap-server kafka-1:29092 --topic wikimedia-stream.dlt \
-  --from-beginning --max-messages 1 2>/dev/null \
+  --from-beginning --max-messages 1 \
   | docker exec -i kafka-1 kafka-console-producer \
     --bootstrap-server kafka-1:29092 --topic wikimedia-stream
 ```
+
+You will still see `Processed a total of 1 messages` in your terminal. That is the consumer writing to stderr, which the pipe does not carry, so it reached your screen rather than the producer. Only the record value went down the pipe, which is also why the original key is lost in this replay.
 
 Now count the headers on the second dead-letter record:
 
