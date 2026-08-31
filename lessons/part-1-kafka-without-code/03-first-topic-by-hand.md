@@ -287,16 +287,18 @@ On your cluster they cannot differ, because the only replica is the leader itsel
 
 </details>
 
-**3. You produce three records to a 1-partition topic and read them back in order. You repeat the exercise on a 3-partition topic and the order differs. Which run demonstrated a Kafka guarantee?**
+**3. You produce three records to `lessons-demo` and read them back in the order you wrote them. You do the same on `ordering-test`, which has 3 partitions, and again they come back in order. Have you now proved that Kafka preserves order on a 3-partition topic?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Only the first. Kafka guarantees ordering within a partition, and with one partition every record shares it, so the total order is guaranteed.
+No. You have proved nothing about the 3-partition case, because the records never used more than one partition.
 
-With three partitions the records were spread across three independent logs, and there is no guarantee about the order a consumer reads across them. The order you observed was an accident of polling and may differ between runs.
+Kafka's guarantee is ordering *within* a partition. On `lessons-demo` that is the whole topic, so the total order is guaranteed and always will be.
 
-If the 3-partition run happened to be stable across runs, that is coincidence, not a promise.
+On `ordering-test` the guarantee only applied because exercise 1 put all three records on a single partition: with no key, the producer picks one partition and sticks to it for the batch. You observed a per-partition guarantee and read it as a topic-wide one.
+
+Spread those three records across three partitions and the guarantee is gone. Each partition is an independent log, and nothing orders a consumer's reads across them. Lesson 04 is where you make that happen on purpose, with keys.
 
 </details>
 
@@ -313,16 +315,18 @@ So the end offset is a write counter, not a "how many records can I read" counte
 
 </details>
 
-**5. Why does the console producer print nothing after sending a record, while your Java producer in Lesson 13 will be able to log the partition and offset?**
+**5. The console producer accepted your three records and printed nothing at all: no partition, no offset, no confirmation. Step 5 then showed that Kafka knew the partition and offset of every one of them. Did the producer have to go back and ask for that information, or did it already have it?**
 
 <details>
 <summary>Reveal answer</summary>
 
-Both receive the same acknowledgment from the broker, a `RecordMetadata` containing topic, partition, offset and timestamp. The console producer throws it away.
+It already had it, and threw it away.
 
-The Java client hands it to you through the `CompletableFuture` that `send()` returns. Nothing extra is requested from the broker; the information was always coming back.
+A `send()` is a round trip with a reply. The broker's acknowledgment is not a bare "received": it is a `RecordMetadata` carrying the topic, partition, offset and timestamp the record was actually assigned. The producer cannot know its offset before the broker appends it, so the only place that number can come from is the reply.
 
-That is a useful early reminder that a `send()` is a round trip with a reply, not a fire-and-forget write, unless you configure `acks=0`, which is Lesson 10.
+`kafka-console-producer` receives that reply and discards it, which is why the prompt just returns. Nothing was hidden from it and nothing extra would have to be requested.
+
+Keep hold of that, because two later lessons are consequences of it. Lesson 10 is about `acks`, which is precisely the setting that controls how much of a reply you wait for, up to `acks=0` where you genuinely do not get one. Lesson 13 is about catching the reply you were already being sent.
 
 </details>
 
