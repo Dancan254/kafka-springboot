@@ -399,4 +399,4 @@ Your consumer is real. It:
 
 What it still does badly is fail. A malformed record stops a partition indefinitely, a database outage becomes a tight retry loop, and there is nowhere for a record to go when retrying will never work.
 
-**Next:** [Lesson 20: DefaultErrorHandler and Retries](20-error-handler-and-retries.md)
+**Next:** [Lesson 20: DefaultErrorHandler and Retries](../part-4-resilience/20-error-handler-and-retries.md)

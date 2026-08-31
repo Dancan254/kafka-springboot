@@ -23,7 +23,7 @@ The consumer side is also where Kafka's failure modes get interesting. A produce
 
 ## Before you start
 
-[Lesson 14](14-wikimedia-sse-stream.md), and a producer that can fill the topic. Records already in `wikimedia-stream` are ideal, because you will watch them replay.
+[Lesson 14](../part-2-producer/14-wikimedia-sse-stream.md), and a producer that can fill the topic. Records already in `wikimedia-stream` are ideal, because you will watch them replay.
 
 ---
 

@@ -166,22 +166,22 @@ Every design decision in this codebase is justified in a lesson. Rather than dup
 
 | Topic | Lesson |
 |---|---|
-| Topics, partitions, offsets | [01](lessons/01-what-kafka-actually-is.md) · [03](lessons/03-first-topic-by-hand.md) |
-| Keys and partition affinity | [04](lessons/04-partitions-and-keys.md) · [11](lessons/11-keys-and-partition-affinity.md) |
-| Consumer groups, lag, replay | [05](lessons/05-offsets-and-consumer-groups.md) |
-| Replication, ISR, `min.insync.replicas` | [06](lessons/06-replication-and-isr.md) |
-| KRaft and the controller quorum | [07](lessons/07-kraft-no-zookeeper.md) |
-| Topic configuration as code | [09](lessons/09-topics-as-code.md) |
-| `acks` and the idempotent producer | [10](lessons/10-acks-and-idempotence.md) |
-| Batching, `linger.ms`, compression | [12](lessons/12-batching-linger-compression.md) |
-| Manual acknowledgment, delivery semantics | [17](lessons/17-manual-acknowledgment.md) |
-| Concurrency and rebalancing | [19](lessons/19-concurrency-and-rebalancing.md) |
-| Retries and the error handler | [20](lessons/20-error-handler-and-retries.md) |
-| Dead-letter topic and its headers | [21](lessons/21-dead-letter-topics.md) · [22](lessons/22-dlt-headers-and-replay.md) |
-| Testing with Testcontainers | [24](lessons/24-testing-with-testcontainers.md) |
-| Schema Registry and Avro | [25](lessons/25-schema-registry-and-avro.md) |
-| Observability (OTel, Prometheus, Grafana) | [26](lessons/26-observability.md) |
-| CLI toolbox, incident recipes, production checklist | [27](lessons/27-ops-and-production-checklist.md) |
+| Topics, partitions, offsets | [01](lessons/part-1-kafka-without-code/01-what-kafka-actually-is.md) · [03](lessons/part-1-kafka-without-code/03-first-topic-by-hand.md) |
+| Keys and partition affinity | [04](lessons/part-1-kafka-without-code/04-partitions-and-keys.md) · [11](lessons/part-2-producer/11-keys-and-partition-affinity.md) |
+| Consumer groups, lag, replay | [05](lessons/part-1-kafka-without-code/05-offsets-and-consumer-groups.md) |
+| Replication, ISR, `min.insync.replicas` | [06](lessons/part-1-kafka-without-code/06-replication-and-isr.md) |
+| KRaft and the controller quorum | [07](lessons/part-1-kafka-without-code/07-kraft-no-zookeeper.md) |
+| Topic configuration as code | [09](lessons/part-2-producer/09-topics-as-code.md) |
+| `acks` and the idempotent producer | [10](lessons/part-2-producer/10-acks-and-idempotence.md) |
+| Batching, `linger.ms`, compression | [12](lessons/part-2-producer/12-batching-linger-compression.md) |
+| Manual acknowledgment, delivery semantics | [17](lessons/part-3-consumer/17-manual-acknowledgment.md) |
+| Concurrency and rebalancing | [19](lessons/part-3-consumer/19-concurrency-and-rebalancing.md) |
+| Retries and the error handler | [20](lessons/part-4-resilience/20-error-handler-and-retries.md) |
+| Dead-letter topic and its headers | [21](lessons/part-4-resilience/21-dead-letter-topics.md) · [22](lessons/part-4-resilience/22-dlt-headers-and-replay.md) |
+| Testing with Testcontainers | [24](lessons/part-5-production/24-testing-with-testcontainers.md) |
+| Schema Registry and Avro | [25](lessons/part-5-production/25-schema-registry-and-avro.md) |
+| Observability (OTel, Prometheus, Grafana) | [26](lessons/part-5-production/26-observability.md) |
+| CLI toolbox, incident recipes, production checklist | [27](lessons/part-5-production/27-ops-and-production-checklist.md) |
 
 ---
 
@@ -191,12 +191,12 @@ It is a **teaching artifact**, not a deployable system. Specifically:
 
 - **No security at all.** `PLAINTEXT` listeners, no authentication, no ACLs, and a database password committed to git.
 - **H2 in memory** with `ddl-auto: create-drop`. Production wants a real database, `validate`, and Flyway migrations.
-- **The producer sends records without a key**, so there is no ordering guarantee between two edits to the same page. Deliberate — this pipeline only counts and stores events — but it constrains every future consumer. See [Lesson 11](lessons/11-keys-and-partition-affinity.md).
-- **The consumer stores duplicates on redelivery.** `(kafka_partition, kafka_offset)` is indexed but not unique. See [Lesson 18](lessons/18-persisting-with-jpa.md).
-- **`WikimediaEventController` returns JPA entities** directly. [Lesson 23](lessons/23-rest-api-over-events.md) builds the version with response DTOs and explains the cost.
+- **The producer sends records without a key**, so there is no ordering guarantee between two edits to the same page. Deliberate — this pipeline only counts and stores events — but it constrains every future consumer. See [Lesson 11](lessons/part-2-producer/11-keys-and-partition-affinity.md).
+- **The consumer stores duplicates on redelivery.** `(kafka_partition, kafka_offset)` is indexed but not unique. See [Lesson 18](lessons/part-3-consumer/18-persisting-with-jpa.md).
+- **`WikimediaEventController` returns JPA entities** directly. [Lesson 23](lessons/part-5-production/23-rest-api-over-events.md) builds the version with response DTOs and explains the cost.
 - **Tracing samples at 100%.** Fine locally, ruinous at scale.
 
-The full production checklist lives in [Lesson 27](lessons/27-ops-and-production-checklist.md).
+The full production checklist lives in [Lesson 27](lessons/part-5-production/27-ops-and-production-checklist.md).
 
 ---
 
@@ -220,7 +220,7 @@ Grafana is at **`http://localhost:3001`** (`admin` / `admin`). Add Prometheus (`
 
 Apps run on the host by default and export to `http://localhost:4318`. Running them inside the compose network instead? Set `OTEL_COLLECTOR_URL=http://otel-collector:4318`.
 
-Setup, verification, and the four ways this stack can fail silently: [Lesson 26](lessons/26-observability.md).
+Setup, verification, and the four ways this stack can fail silently: [Lesson 26](lessons/part-5-production/26-observability.md).
 
 ---
 

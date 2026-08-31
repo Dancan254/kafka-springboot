@@ -43,7 +43,7 @@ Work through them in order. Lessons build on each other, and the quizzes assume 
 
 You should be comfortable with Java and basic Spring Boot: `@Service`, `@RestController`, constructor injection. You need no prior Kafka, Docker Compose or observability experience.
 
-Software requirements are covered in [Lesson 00](00-prerequisites-and-cluster.md). Java and Maven are not needed until Lesson 08.
+Software requirements are covered in [Lesson 00](part-0-setup/00-prerequisites-and-cluster.md). Java and Maven are not needed until Lesson 08.
 
 ---
 
@@ -64,7 +64,7 @@ flowchart LR
 
 | # | Lesson |
 |---|---|
-| 00 | [Prerequisites and your first broker](00-prerequisites-and-cluster.md) |
+| 00 | [Prerequisites and your first broker](part-0-setup/00-prerequisites-and-cluster.md) |
 
 ## Part 1: Kafka Without Code
 
@@ -72,53 +72,53 @@ flowchart LR
 
 | # | Lesson |
 |---|---|
-| 01 | [What Kafka actually is](01-what-kafka-actually-is.md), a log rather than a queue |
-| 02 | [A tour of Kafka UI](02-tour-of-kafka-ui.md) |
-| 03 | [Create a topic, produce and consume by hand](03-first-topic-by-hand.md) |
-| 04 | [Partitions and keys](04-partitions-and-keys.md) |
-| 05 | [Offsets and consumer groups](05-offsets-and-consumer-groups.md) |
-| 06 | [Replication and ISR](06-replication-and-isr.md), grow the cluster and kill a broker |
-| 07 | [KRaft](07-kraft-no-zookeeper.md), Kafka without ZooKeeper |
+| 01 | [What Kafka actually is](part-1-kafka-without-code/01-what-kafka-actually-is.md), a log rather than a queue |
+| 02 | [A tour of Kafka UI](part-1-kafka-without-code/02-tour-of-kafka-ui.md) |
+| 03 | [Create a topic, produce and consume by hand](part-1-kafka-without-code/03-first-topic-by-hand.md) |
+| 04 | [Partitions and keys](part-1-kafka-without-code/04-partitions-and-keys.md) |
+| 05 | [Offsets and consumer groups](part-1-kafka-without-code/05-offsets-and-consumer-groups.md) |
+| 06 | [Replication and ISR](part-1-kafka-without-code/06-replication-and-isr.md), grow the cluster and kill a broker |
+| 07 | [KRaft](part-1-kafka-without-code/07-kraft-no-zookeeper.md), Kafka without ZooKeeper |
 
 ## Part 2: The Producer
 
 | # | Lesson |
 |---|---|
-| 08 | [Your first `KafkaTemplate.send()`](08-first-kafkatemplate-send.md) |
-| 09 | [Topics as code](09-topics-as-code.md) |
-| 10 | [`acks` and the idempotent producer](10-acks-and-idempotence.md) |
-| 11 | [Keys and partition affinity in code](11-keys-and-partition-affinity.md) |
-| 12 | [Batching, linger and compression](12-batching-linger-compression.md) |
-| 13 | [Send callbacks and error handling](13-send-callbacks-and-errors.md) |
-| 14 | [Real data, the Wikimedia SSE stream](14-wikimedia-sse-stream.md) |
+| 08 | [Your first `KafkaTemplate.send()`](part-2-producer/08-first-kafkatemplate-send.md) |
+| 09 | [Topics as code](part-2-producer/09-topics-as-code.md) |
+| 10 | [`acks` and the idempotent producer](part-2-producer/10-acks-and-idempotence.md) |
+| 11 | [Keys and partition affinity in code](part-2-producer/11-keys-and-partition-affinity.md) |
+| 12 | [Batching, linger and compression](part-2-producer/12-batching-linger-compression.md) |
+| 13 | [Send callbacks and error handling](part-2-producer/13-send-callbacks-and-errors.md) |
+| 14 | [Real data, the Wikimedia SSE stream](part-2-producer/14-wikimedia-sse-stream.md) |
 
 ## Part 3: The Consumer
 
 | # | Lesson |
 |---|---|
-| 15 | [Your first `@KafkaListener`](15-first-kafkalistener.md) |
-| 16 | [DTO records and deserialization](16-dtos-and-deserialization.md) |
-| 17 | [Manual acknowledgment](17-manual-acknowledgment.md) |
-| 18 | [Persisting with JPA](18-persisting-with-jpa.md) |
-| 19 | [Concurrency and rebalancing](19-concurrency-and-rebalancing.md) |
+| 15 | [Your first `@KafkaListener`](part-3-consumer/15-first-kafkalistener.md) |
+| 16 | [DTO records and deserialization](part-3-consumer/16-dtos-and-deserialization.md) |
+| 17 | [Manual acknowledgment](part-3-consumer/17-manual-acknowledgment.md) |
+| 18 | [Persisting with JPA](part-3-consumer/18-persisting-with-jpa.md) |
+| 19 | [Concurrency and rebalancing](part-3-consumer/19-concurrency-and-rebalancing.md) |
 
 ## Part 4: Resilience
 
 | # | Lesson |
 |---|---|
-| 20 | [`DefaultErrorHandler` and retries](20-error-handler-and-retries.md) |
-| 21 | [Dead-letter topics](21-dead-letter-topics.md) |
-| 22 | [DLT headers and replay](22-dlt-headers-and-replay.md) |
+| 20 | [`DefaultErrorHandler` and retries](part-4-resilience/20-error-handler-and-retries.md) |
+| 21 | [Dead-letter topics](part-4-resilience/21-dead-letter-topics.md) |
+| 22 | [DLT headers and replay](part-4-resilience/22-dlt-headers-and-replay.md) |
 
 ## Part 5: Production
 
 | # | Lesson |
 |---|---|
-| 23 | [A REST API over consumed events](23-rest-api-over-events.md) |
-| 24 | [Testing Kafka with Testcontainers](24-testing-with-testcontainers.md) |
-| 25 | [Schema Registry and Avro](25-schema-registry-and-avro.md) |
-| 26 | [Observability](26-observability.md) |
-| 27 | [Ops toolbox and production checklist](27-ops-and-production-checklist.md) |
+| 23 | [A REST API over consumed events](part-5-production/23-rest-api-over-events.md) |
+| 24 | [Testing Kafka with Testcontainers](part-5-production/24-testing-with-testcontainers.md) |
+| 25 | [Schema Registry and Avro](part-5-production/25-schema-registry-and-avro.md) |
+| 26 | [Observability](part-5-production/26-observability.md) |
+| 27 | [Ops toolbox and production checklist](part-5-production/27-ops-and-production-checklist.md) |
 
 ---
 
@@ -167,4 +167,4 @@ If something does not match what you see, the CLI is the source of truth. That h
 
 ---
 
-Ready? **[Start with Lesson 00](00-prerequisites-and-cluster.md)**
+Ready? **[Start with Lesson 00](part-0-setup/00-prerequisites-and-cluster.md)**

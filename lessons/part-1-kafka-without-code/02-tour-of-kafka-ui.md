@@ -23,7 +23,7 @@ More practically: when a Kafka pipeline breaks at 2 a.m., the first thing anyone
 
 ## Before you start
 
-[Lesson 00](00-prerequisites-and-cluster.md), with your broker healthy:
+[Lesson 00](../part-0-setup/00-prerequisites-and-cluster.md), with your broker healthy:
 
 ```bash
 docker compose ps kafka-1
