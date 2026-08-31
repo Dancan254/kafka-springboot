@@ -461,4 +461,4 @@ What it still does not do is survive its own failures. Records dropped after the
 
 Time to build the other half.
 
-**Next:** [Lesson 15: Your First KafkaListener](15-first-kafkalistener.md)
+**Next:** [Lesson 15: Your First KafkaListener](../part-3-consumer/15-first-kafkalistener.md)

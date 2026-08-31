@@ -23,7 +23,7 @@ Everything you built by hand in Part 1 is about to be produced to by code. When 
 
 ## Before you start
 
-[Lesson 07](07-kraft-no-zookeeper.md), with a healthy three-broker cluster:
+[Lesson 07](../part-1-kafka-without-code/07-kraft-no-zookeeper.md), with a healthy three-broker cluster:
 
 ```bash
 docker compose ps kafka-1 kafka-2 kafka-3

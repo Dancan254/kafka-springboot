@@ -371,4 +371,4 @@ Every one of those is something you can see rather than recite. When your Spring
 
 Now write some code.
 
-**Next:** [Lesson 08: Your First KafkaTemplate.send()](08-first-kafkatemplate-send.md)
+**Next:** [Lesson 08: Your First KafkaTemplate.send()](../part-2-producer/08-first-kafkatemplate-send.md)

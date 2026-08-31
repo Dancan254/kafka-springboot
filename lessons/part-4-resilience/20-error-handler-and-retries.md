@@ -23,7 +23,7 @@ This is also where a decision you made three lessons ago pays off. The exception
 
 ## Before you start
 
-[Lesson 19](19-concurrency-and-rebalancing.md), with concurrency set to 3.
+[Lesson 19](../part-3-consumer/19-concurrency-and-rebalancing.md), with concurrency set to 3.
 
 ---
 

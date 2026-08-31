@@ -420,4 +420,4 @@ You also know why the cluster is deliberately small: partitions, offsets, consum
 
 No code yet, and none for a while.
 
-**Next:** [Lesson 01: What Kafka Actually Is](01-what-kafka-actually-is.md)
+**Next:** [Lesson 01: What Kafka Actually Is](../part-1-kafka-without-code/01-what-kafka-actually-is.md)

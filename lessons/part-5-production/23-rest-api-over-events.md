@@ -23,7 +23,7 @@ The mistake is easy to make, invisible in testing, and expensive to reverse: ret
 
 ## Before you start
 
-[Lesson 22](22-dlt-headers-and-replay.md), with events in the table.
+[Lesson 22](../part-4-resilience/22-dlt-headers-and-replay.md), with events in the table.
 
 Add the web starter to the consumer:
 

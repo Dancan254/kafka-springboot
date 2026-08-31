@@ -421,4 +421,4 @@ Your pipeline now fails properly. It:
 
 You also know why replay is a repair tool rather than a routine mechanism, and which guarantees it cannot restore.
 
-**Next:** [Lesson 23: A REST API over Consumed Events](23-rest-api-over-events.md)
+**Next:** [Lesson 23: A REST API over Consumed Events](../part-5-production/23-rest-api-over-events.md)

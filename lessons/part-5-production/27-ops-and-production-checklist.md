@@ -429,4 +429,4 @@ Three directions, in increasing distance from what you have built.
 
 **Kafka Connect.** Most pipelines that move data between Kafka and something else do not need an application at all. Connect is the framework for that, and knowing when not to write a consumer is worth as much as knowing how.
 
-Back to the **[course index](README.md)**.
+Back to the **[course index](../README.md)**.

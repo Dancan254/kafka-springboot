@@ -27,7 +27,7 @@ Get this right and the rest of the course is mostly detail.
 
 ## Before you start
 
-[Lesson 00](00-prerequisites-and-cluster.md), with your broker running:
+[Lesson 00](../part-0-setup/00-prerequisites-and-cluster.md), with your broker running:
 
 ```bash
 docker compose ps kafka-1
